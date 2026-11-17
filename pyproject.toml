@@ -38,10 +38,17 @@ packages = ["src/homunculus"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# Python warns when a file, a socket or a database is thrown away without being closed. Here every warning
+# fails the tests, so nothing they open, in the tests or in the code under test, is left open.
+filterwarnings = ["error"]
 
 [tool.ruff]
 line-length = 120
 target-version = "py311"
 
 [tool.ruff.lint]
-select = ["E", "F", "W", "I", "B", "UP", "SIM", "RET"]
+# C4, FURB, PERF, PIE and RUF name the built-in or standard-library construct that hand-written code repeats.
+# ASYNC finds calls that block the event loop.
+select = ["E", "F", "W", "I", "B", "UP", "SIM", "RET", "C4", "FURB", "PERF", "PIE", "ASYNC", "RUF"]
+# RUF012 does not see that the models are pydantic's, which copy a list given as a default.
+ignore = ["RUF012"]

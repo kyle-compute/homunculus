@@ -86,7 +86,7 @@ def test_a_command_names_a_shipped_rig_in_any_case_and_a_rig_of_your_own_by_its_
     # A bare word is always a shipped rig's name, never a folder that happens to be here.
     with pytest.raises(StartupError, match="no rig named 'my-arm'"):
         rigs.find("my-arm")
-    with pytest.raises(StartupError, match="is not a rig: it has no rig.toml"):
+    with pytest.raises(StartupError, match=r"is not a rig: it has no rig\.toml"):
         rigs.find("./objects")
 
 
@@ -128,7 +128,7 @@ def test_a_rig_file_named_like_one_of_its_menagerie_robots_files_is_refused(tmp_
     (mine / "README.md").write_text("my arm")
     assert list(load_backends("mujoco", {"rig": str(mine)})) == ["my-arm"]
     (mine / "panda.xml").write_text(MODEL)
-    with pytest.raises(StartupError, match="panda.xml is in the rig folder .* and in Menagerie's franka_emika_panda"):
+    with pytest.raises(StartupError, match=r"panda\.xml is in the rig folder .* and in Menagerie's franka_emika_panda"):
         load_backends("mujoco", {"rig": str(mine)})
 
 

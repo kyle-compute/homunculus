@@ -18,7 +18,7 @@ import sys
 import threading
 import time
 from collections.abc import Callable, Iterator
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from pathlib import Path
 
 import anyio.to_thread
@@ -88,7 +88,10 @@ class ManualClock:
 
 
 class Harness:
-    """One robot behind a runtime, on a clock that only the test advances: a fake one unless `backend` is given."""
+    """One robot behind a runtime, on a clock that only the test advances: a fake one unless `backend` is given.
+
+    It holds the journal and the robot of the incarnation that is running. Leaving its `with` block closes both.
+    """
 
     def __init__(
         self,
@@ -104,22 +107,32 @@ class Harness:
         self.make_backend = backend
         self.requests = itertools.count(1)
         self.boots = 0
+        self.incarnation = ExitStack()  # the journal and the robot that the running incarnation holds
         self.boot()
+
+    def __enter__(self) -> Harness:
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self.incarnation.close()
 
     def boot(self) -> None:
         """Start a runtime incarnation as a process restart would: new boot, same journal file."""
-        if self.boots:
-            self.journal.close()  # the process that held it is gone
+        self.incarnation.close()  # the process that held the journal and the robot is gone
         self.boots += 1
         boot_id = f"boot-{self.boots:08d}"
-        self.journal = Journal(self.journal_path, boot_id, quota=(self.limits or ServiceLimits()).journal_quota)
-        if self.make_backend is None:
-            self.backend, robot_id = FakeBackend(self.robot, self.clock), f"fake-{self.robot}"
-        else:
-            self.backend, robot_id = self.make_backend(self.clock), self.robot
-        self.runtime = Runtime(
-            robot_id, self.backend, self.journal, boot_id=boot_id, clock=self.clock, limits=self.limits
-        )
+        quota = (self.limits or ServiceLimits()).journal_quota
+        with ExitStack() as opened:  # closed again if the runtime refuses the robot
+            self.journal = opened.enter_context(Journal(self.journal_path, boot_id, quota=quota))
+            if self.make_backend is None:
+                backend, robot_id = FakeBackend(self.robot, self.clock), f"fake-{self.robot}"
+            else:
+                backend, robot_id = self.make_backend(self.clock), self.robot
+            self.backend = opened.enter_context(backend)
+            self.runtime = Runtime(
+                robot_id, self.backend, self.journal, boot_id=boot_id, clock=self.clock, limits=self.limits
+            )
+            self.incarnation = opened.pop_all()
         self.context = self.runtime.describe().context_id
         self.session = None
 
@@ -186,13 +199,15 @@ class Harness:
 
 
 @pytest.fixture
-def arm(tmp_path) -> Harness:
-    return Harness(tmp_path / "journal.sqlite", "arm")
+def arm(tmp_path) -> Iterator[Harness]:
+    with Harness(tmp_path / "journal.sqlite", "arm") as harness:
+        yield harness
 
 
 @pytest.fixture
-def g1(tmp_path) -> Harness:
-    return Harness(tmp_path / "journal.sqlite", "g1")
+def g1(tmp_path) -> Iterator[Harness]:
+    with Harness(tmp_path / "journal.sqlite", "g1") as harness:
+        yield harness
 
 
 def velocity(forward: float) -> BaseVelocityTarget:
@@ -377,24 +392,24 @@ def test_a_goal_past_its_deadline_neither_starts_nor_counts_as_completed(arm):
 def test_a_goal_that_cannot_finish_within_its_deadline_is_refused_before_it_moves(
     tmp_path, robot, action, too_short, enough
 ):
-    harness = Harness(tmp_path / "journal.sqlite", robot)
-    harness.open()
+    with Harness(tmp_path / "journal.sqlite", robot) as harness:
+        harness.open()
 
-    def dry_run(**settings):
-        return harness.runtime.validate(ValidateRequest(goal=GoalSpec(action=action, **settings)))
+        def dry_run(**settings):
+            return harness.runtime.validate(ValidateRequest(goal=GoalSpec(action=action, **settings)))
 
-    # The motion a request states, and the rest it must then be measured at, end after the deadline does.
-    assert refused(lambda: harness.submit(action, **too_short)) == "limit_exceeded"
-    # A dry run checks the goal as it would be submitted, its deadlines and start conditions included.
-    assert refused(lambda: dry_run(**too_short)) == "limit_exceeded"
-    elsewhere = StartConditions(required_mode="another mode")
-    assert refused(lambda: dry_run(**enough, start_conditions=elsewhere)) == "start_condition_failed"
-    assert dry_run(**enough).valid
-    assert harness.backend.effects == []
-    assert all(resource.activity is None for resource in harness.runtime.describe().resources)
+        # The motion a request states, and the rest it must then be measured at, end after the deadline does.
+        assert refused(lambda: harness.submit(action, **too_short)) == "limit_exceeded"
+        # A dry run checks the goal as it would be submitted, its deadlines and start conditions included.
+        assert refused(lambda: dry_run(**too_short)) == "limit_exceeded"
+        elsewhere = StartConditions(required_mode="another mode")
+        assert refused(lambda: dry_run(**enough, start_conditions=elsewhere)) == "start_condition_failed"
+        assert dry_run(**enough).valid
+        assert harness.backend.effects == []
+        assert all(resource.activity is None for resource in harness.runtime.describe().resources)
 
-    goal = harness.finish(harness.submit(action, **enough), 31.5)
-    assert (goal.state, goal.result.reason) == ("succeeded", "completed")
+        goal = harness.finish(harness.submit(action, **enough), 31.5)
+        assert (goal.state, goal.result.reason) == ("succeeded", "completed")
 
 
 # --------------------------------------------------------------------------
@@ -697,16 +712,16 @@ def test_a_stop_reports_failure_when_standstill_is_not_measured(g1):
 def test_blocked_motion_fails_on_measurement_and_never_succeeds_on_elapsed_time(
     tmp_path, robot, resource, action, settings, reason
 ):
-    harness = Harness(tmp_path / "journal.sqlite", robot)
-    harness.open()
-    harness.backend.faults.add(("blocked", resource))
-    goal = harness.finish(harness.submit(action, **settings), 1.5)
-    assert (goal.state, goal.result.reason, goal.result.stop_confirmed) == ("failed", reason, True)
-    assert harness.effects("stop") == [("stop", (resource,))]
+    with Harness(tmp_path / "journal.sqlite", robot) as harness:
+        harness.open()
+        harness.backend.faults.add(("blocked", resource))
+        goal = harness.finish(harness.submit(action, **settings), 1.5)
+        assert (goal.state, goal.result.reason, goal.result.stop_confirmed) == ("failed", reason, True)
+        assert harness.effects("stop") == [("stop", (resource,))]
 
-    # The goal failed, not the robot: once it can move again the same action succeeds.
-    harness.backend.faults.clear()
-    assert harness.finish(harness.submit(action), 4.0).state == "succeeded"
+        # The goal failed, not the robot: once it can move again the same action succeeds.
+        harness.backend.faults.clear()
+        assert harness.finish(harness.submit(action), 4.0).state == "succeeded"
 
 
 # --------------------------------------------------------------------------
@@ -772,71 +787,75 @@ def test_a_restart_reports_whether_an_interrupted_stream_had_commanded_motion(g1
 
 def test_dropping_old_records_from_memory_never_breaks_a_barrier(tmp_path):
     """Records beyond the retention limit leave memory. That must not cut short a reset or a session's end."""
-    harness = Harness(tmp_path / "journal.sqlite", "arm", limits=ServiceLimits(operation_retention=2))
-    harness.open()
-    earlier = [harness.finish(harness.submit(gripper(width)), 1.0) for width in (0.02, 0.03, 0.04)]
-    # The first of them is read from the journal.
-    assert [harness.runtime.goal(goal.goal_id).state for goal in earlier] == ["succeeded"] * 3
+    with Harness(tmp_path / "journal.sqlite", "arm", limits=ServiceLimits(operation_retention=2)) as harness:
+        harness.open()
+        earlier = [harness.finish(harness.submit(gripper(width)), 1.0) for width in (0.02, 0.03, 0.04)]
+        # The first of them is read from the journal.
+        assert [harness.runtime.goal(goal.goal_id).state for goal in earlier] == ["succeeded"] * 3
 
-    moving = harness.submit(reach(joint1=1.0, at=2.0))
-    harness.run(0.5)
-    waiting = harness.submit(gripper(0.05))
-    reset = harness.manage("world.reset", seconds=0.1)
-    assert reset.state == "succeeded" and reset.new_context_id != harness.context
-    assert [harness.runtime.goal(goal.goal_id).state for goal in (moving, waiting)] == ["interrupted", "interrupted"]
+        moving = harness.submit(reach(joint1=1.0, at=2.0))
+        harness.run(0.5)
+        waiting = harness.submit(gripper(0.05))
+        reset = harness.manage("world.reset", seconds=0.1)
+        assert reset.state == "succeeded" and reset.new_context_id != harness.context
+        assert [harness.runtime.goal(goal.goal_id).state for goal in (moving, waiting)] == [
+            "interrupted",
+            "interrupted",
+        ]
 
-    harness.context = reset.new_context_id
-    harness.open()
-    undispatched = [harness.submit(reach(joint1=0.5)), harness.submit(gripper(0.02))]
-    applied = len(harness.effects("apply"))
-    assert harness.runtime.close_session(CLIENT, harness.session).state == "closed"
-    harness.run(0.5)
-    assert [harness.runtime.goal(goal.goal_id).state for goal in undispatched] == ["cancelled", "cancelled"]
-    assert len(harness.effects("apply")) == applied
+        harness.context = reset.new_context_id
+        harness.open()
+        undispatched = [harness.submit(reach(joint1=0.5)), harness.submit(gripper(0.02))]
+        applied = len(harness.effects("apply"))
+        assert harness.runtime.close_session(CLIENT, harness.session).state == "closed"
+        harness.run(0.5)
+        assert [harness.runtime.goal(goal.goal_id).state for goal in undispatched] == ["cancelled", "cancelled"]
+        assert len(harness.effects("apply")) == applied
 
 
 def test_a_journal_has_one_owner_at_a_time(tmp_path):
     """Two runtimes on one journal would each answer retries with the other's operations."""
     path = tmp_path / "journal.sqlite"
     assert not held(path)
-    first = Journal(path, "boot-1")
-    assert held(path)  # how `homunculus demo stop` knows not to remove a live service's files
-    with pytest.raises(JournalInUse):
-        Journal(path, "boot-2")
-    first.close()  # as when its process exits or is killed
-    assert not held(path)
+    with Journal(path, "boot-1"):
+        assert held(path)  # how `homunculus demo stop` knows not to remove a live service's files
+        with pytest.raises(JournalInUse):
+            Journal(path, "boot-2")
+    assert not held(path)  # closed, as when its process exits or is killed
     Journal(path, "boot-2").close()
 
 
 def test_a_full_journal_refuses_new_work_but_still_answers_retries_and_stops(tmp_path):
     """Room is made only from retired contexts. Dropping a current identity would let a retry move the robot twice."""
-    harness = Harness(tmp_path / "journal.sqlite", "arm", limits=ServiceLimits(journal_quota=4, operation_retention=2))
-    old_session = harness.open()
-    old_context = harness.context
-    first = harness.finish(harness.submit(gripper(0.03), request_id="first"), 1.0)
-    for width in (0.05, 0.02):
-        harness.finish(harness.submit(gripper(width)), 1.0)
-    applied = len(harness.effects("apply"))
+    with Harness(
+        tmp_path / "journal.sqlite", "arm", limits=ServiceLimits(journal_quota=4, operation_retention=2)
+    ) as harness:
+        old_session = harness.open()
+        old_context = harness.context
+        first = harness.finish(harness.submit(gripper(0.03), request_id="first"), 1.0)
+        for width in (0.05, 0.02):
+            harness.finish(harness.submit(gripper(width)), 1.0)
+        applied = len(harness.effects("apply"))
 
-    assert refused(lambda: harness.submit(gripper(0.04))) == "journal_full"
-    again = harness.submit(gripper(0.03), request_id="first")
-    assert (again.goal_id, again.state) == (first.goal_id, "succeeded")
-    assert len(harness.effects("apply")) == applied
-    # A refused request leaves nothing behind: no operation that never finishes, to crowd the record of
-    # the stop below out of the two that memory keeps here.
-    for attempt in ("reset-1", "reset-2", "reset-3"):
-        reset = ManagementRequest(request_id=attempt, context_id=old_context, operation="world.reset")
-        assert refused(lambda reset=reset: harness.runtime.manage(OPERATOR, reset)) == "journal_full"
-    stop = harness.runtime.stop(CLIENT, Authority(session_id=old_session, context_id=old_context))
-    harness.run(1.0)
-    assert harness.runtime.operation(stop.operation_id).state == "succeeded"
-    assert harness.effects("world.reset") == []
+        assert refused(lambda: harness.submit(gripper(0.04))) == "journal_full"
+        again = harness.submit(gripper(0.03), request_id="first")
+        assert (again.goal_id, again.state) == (first.goal_id, "succeeded")
+        assert len(harness.effects("apply")) == applied
+        # A refused request leaves nothing behind: no operation that never finishes, to crowd the record of
+        # the stop below out of the two that memory keeps here.
+        for attempt in ("reset-1", "reset-2", "reset-3"):
+            reset = ManagementRequest(request_id=attempt, context_id=old_context, operation="world.reset")
+            assert refused(lambda reset=reset: harness.runtime.manage(OPERATOR, reset)) == "journal_full"
+        stop = harness.runtime.stop(CLIENT, Authority(session_id=old_session, context_id=old_context))
+        harness.run(1.0)
+        assert harness.runtime.operation(stop.operation_id).state == "succeeded"
+        assert harness.effects("world.reset") == []
 
-    harness.boot()  # a restart retires that context, so its finished requests make room
-    harness.open()
-    assert harness.finish(harness.submit(gripper(0.04)), 1.0).state == "succeeded"
-    retry = dict(request_id="first", session_id=old_session, context_id=old_context)
-    assert refused(lambda: harness.submit(gripper(0.03), **retry)) == "stale_context"
+        harness.boot()  # a restart retires that context, so its finished requests make room
+        harness.open()
+        assert harness.finish(harness.submit(gripper(0.04)), 1.0).state == "succeeded"
+        retry = {"request_id": "first", "session_id": old_session, "context_id": old_context}
+        assert refused(lambda: harness.submit(gripper(0.03), **retry)) == "stale_context"
 
 
 def test_a_world_reset_interrupts_work_and_starts_a_new_context(arm):
@@ -955,31 +974,31 @@ def test_requests_that_end_motion_are_answered_while_every_shared_worker_is_busy
     ],
 )
 def test_a_command_the_description_does_not_offer_is_rejected(tmp_path, robot, action, code):
-    harness = Harness(tmp_path / "journal.sqlite", robot)
-    harness.open()
-    assert refused(lambda: harness.submit(action)) == code
-    harness.run(0.2)
-    assert harness.effects("apply") == []
+    with Harness(tmp_path / "journal.sqlite", robot) as harness:
+        harness.open()
+        assert refused(lambda: harness.submit(action)) == code
+        harness.run(0.2)
+        assert harness.effects("apply") == []
 
 
 def test_each_description_runs_its_own_profiles_and_declares_what_may_run_together(tmp_path):
-    g1, arm = Harness(tmp_path / "g1.sqlite", "g1"), Harness(tmp_path / "arm.sqlite", "arm")
-    assert {p.profile for p in g1.runtime.describe().profiles} == {"base.planar_velocity/1", "hand.posture/1"}
-    assert {p.profile for p in arm.runtime.describe().profiles} == {"joints.trajectory/1", "gripper.width/1"}
+    with Harness(tmp_path / "g1.sqlite", "g1") as g1, Harness(tmp_path / "arm.sqlite", "arm") as arm:
+        assert {p.profile for p in g1.runtime.describe().profiles} == {"base.planar_velocity/1", "hand.posture/1"}
+        assert {p.profile for p in arm.runtime.describe().profiles} == {"joints.trajectory/1", "gripper.width/1"}
 
-    g1.open()
-    # Both runtimes share a boot, as the robots of one service do. An observation of the arm is still not
-    # one of the base, however many observations the base has issued itself.
-    seen_on_arm = arm.runtime.observe().observation_id
-    assert g1.runtime.observe().observation_id != seen_on_arm
-    assert refused(lambda: g1.open_stream(forward=0.2, basis=seen_on_arm)) == "basis_invalid"
-    walk = g1.submit(drive(0.3, duration=1.0))
-    # No base-and-hand combination is validated on this description.
-    assert refused(lambda: g1.submit(posture("fist"))) == "resource_busy"
-    walk = g1.finish(walk, 1.5)
-    assert walk.state == "succeeded"
-    assert walk.result.measurements["displacement"]["x_m"] == pytest.approx(0.3)
-    assert g1.finish(g1.submit(posture("fist")), 1.0).state == "succeeded"
+        g1.open()
+        # Both runtimes share a boot, as the robots of one service do. An observation of the arm is still not
+        # one of the base, however many observations the base has issued itself.
+        seen_on_arm = arm.runtime.observe().observation_id
+        assert g1.runtime.observe().observation_id != seen_on_arm
+        assert refused(lambda: g1.open_stream(forward=0.2, basis=seen_on_arm)) == "basis_invalid"
+        walk = g1.submit(drive(0.3, duration=1.0))
+        # No base-and-hand combination is validated on this description.
+        assert refused(lambda: g1.submit(posture("fist"))) == "resource_busy"
+        walk = g1.finish(walk, 1.5)
+        assert walk.state == "succeeded"
+        assert walk.result.measurements["displacement"]["x_m"] == pytest.approx(0.3)
+        assert g1.finish(g1.submit(posture("fist")), 1.0).state == "succeeded"
 
 
 # --------------------------------------------------------------------------
@@ -1009,17 +1028,17 @@ def test_a_backend_of_your_own_loads_by_import_path_and_is_judged_on_its_measure
     assert list(robots) == ["lift"] and robots["lift"].gain == 15.0
     lift = sys.modules["lift"]
 
-    harness = Harness(tmp_path / "lift.sqlite", "lift", backend=lambda clock: lift.Lift(clock, gain=15.0))
-    harness.open()
-    goal = harness.finish(harness.submit(trajectory("lift", ["lift"], [0.5], at=2.0)), 3.0)
-    assert goal.state == "succeeded"
-    assert goal.result.measurements["final_error"]["lift"] <= lift.LIMITS.goal_tolerance
+    with Harness(tmp_path / "lift.sqlite", "lift", backend=lambda clock: lift.Lift(clock, gain=15.0)) as harness:
+        harness.open()
+        goal = harness.finish(harness.submit(trajectory("lift", ["lift"], [0.5], at=2.0)), 3.0)
+        assert goal.state == "succeeded"
+        assert goal.result.measurements["final_error"]["lift"] <= lift.LIMITS.goal_tolerance
 
-    # A motor too weak to keep up lags the path, and the same judge fails it on what was measured.
-    weak = Harness(tmp_path / "weak.sqlite", "lift", backend=lambda clock: lift.Lift(clock, gain=1.0))
-    weak.open()
-    goal = weak.finish(weak.submit(trajectory("lift", ["lift"], [0.5], at=2.0)), 3.0)
-    assert (goal.state, goal.result.reason) == ("failed", "path_tolerance_violated")
+        # A motor too weak to keep up lags the path, and the same judge fails it on what was measured.
+        with Harness(tmp_path / "weak.sqlite", "lift", backend=lambda clock: lift.Lift(clock, gain=1.0)) as weak:
+            weak.open()
+            goal = weak.finish(weak.submit(trajectory("lift", ["lift"], [0.5], at=2.0)), 3.0)
+            assert (goal.state, goal.result.reason) == ("failed", "path_tolerance_violated")
 
 
 def test_a_backend_whose_samples_lack_positions_or_velocities_is_refused_at_start(tmp_path, monkeypatch):
@@ -1063,21 +1082,21 @@ def test_a_service_that_cannot_start_closes_the_backend_it_built(tmp_path, monke
 
 
 def test_a_session_held_for_a_block_is_released_however_the_block_ends(tmp_path, monkeypatch):
-    harness = Harness(tmp_path / "journal.sqlite", "arm")
-    service = Service({"fake-arm": harness.runtime}, {"client-token": CLIENT}, "boot-00000001", ServiceLimits())
-    monkeypatch.setenv("HOMUNCULUS_HOME", str(tmp_path / "home"))
-    with serving(service) as url:
-        store = TargetStore()
-        store.connect(url, "client-token")
-        with RobotClient(store.get("fake:arm")) as robot:
-            with robot.session() as session:
-                assert robot.describe().session.held and session.state == "active"
-            assert not robot.describe().session.held
+    with Harness(tmp_path / "journal.sqlite", "arm") as harness:
+        service = Service({"fake-arm": harness.runtime}, {"client-token": CLIENT}, "boot-00000001", ServiceLimits())
+        monkeypatch.setenv("HOMUNCULUS_HOME", str(tmp_path / "home"))
+        with serving(service) as url:
+            store = TargetStore()
+            store.connect(url, "client-token")
+            with RobotClient(store.get("fake:arm")) as robot:
+                with robot.session() as session:
+                    assert robot.describe().session.held and session.state == "active"
+                assert not robot.describe().session.held
 
-            with pytest.raises(RuntimeError, match="in the block"), robot.session():
-                raise RuntimeError("in the block")
-            assert not robot.describe().session.held
-            robot.open_session()  # so nothing refuses it with session_conflict
+                with pytest.raises(RuntimeError, match="in the block"), robot.session():
+                    raise RuntimeError("in the block")
+                assert not robot.describe().session.held
+                robot.open_session()  # so nothing refuses it with session_conflict
 
 
 @pytest.mark.parametrize(
@@ -1135,14 +1154,14 @@ def test_the_mujoco_backend_drives_a_rig_of_your_own(tmp_path):
     assert list(load_backends("mujoco", {"rig": str(folder)})) == ["two"]  # named after its folder
     assert list(load_backends("mujoco", {"rig": str(folder), "robot_id": "left"})) == ["left"]
 
-    harness = Harness(tmp_path / "two.sqlite", "two", backend=lambda clock: MujocoBackend(clock, folder))
-    description = harness.runtime.describe()
-    assert [(b.profile, b.target) for b in description.profiles] == [("joints.trajectory/1", "arm")]
-    assert [joint.unit for joint in description.profiles[0].limits.joints] == ["rad", "m"]
-    harness.open()
-    goal = harness.finish(harness.submit(trajectory("arm", ["swing", "reach"], [0.8, 0.15], at=2.0)), 3.0)
-    assert goal.state == "succeeded"
-    assert max(goal.result.measurements["final_error"].values()) <= 0.02
+    with Harness(tmp_path / "two.sqlite", "two", backend=lambda clock: MujocoBackend(clock, folder)) as harness:
+        description = harness.runtime.describe()
+        assert [(b.profile, b.target) for b in description.profiles] == [("joints.trajectory/1", "arm")]
+        assert [joint.unit for joint in description.profiles[0].limits.joints] == ["rad", "m"]
+        harness.open()
+        goal = harness.finish(harness.submit(trajectory("arm", ["swing", "reach"], [0.8, 0.15], at=2.0)), 3.0)
+        assert goal.state == "succeeded"
+        assert max(goal.result.measurements["final_error"].values()) <= 0.02
 
 
 @pytest.mark.parametrize(
@@ -1461,60 +1480,60 @@ def video_parts(chunks: Iterator[bytes]) -> Iterator[tuple[str, bytes]]:
 
 
 def test_a_camera_plays_live_through_a_link_that_needs_no_token(tmp_path, monkeypatch, capsys):
-    harness = Harness(tmp_path / "journal.sqlite", "fake-arm", backend=Filmed)
-    limits = ServiceLimits(max_video_viewers=1)
-    service = Service({"fake-arm": harness.runtime}, {"client-token": CLIENT}, "boot-00000001", limits)
-    with serving(service) as url:
-        monkeypatch.setenv("HOMUNCULUS_HOME", str(tmp_path / "home"))
-        store = TargetStore()
-        store.connect(url, "client-token")
-        store.save()
-        assert cli_main(["--json", "video", "front"]) == 0
-        link = VideoLink.model_validate_json(capsys.readouterr().out)
-        assert (link.camera, link.fps, link.expires_in_s) == ("front", 50.0, 600.0)
-        assert link.url.startswith(f"{url}/v1/robots/fake-arm/video?camera=front&until=")
+    with Harness(tmp_path / "journal.sqlite", "fake-arm", backend=Filmed) as harness:
+        limits = ServiceLimits(max_video_viewers=1)
+        service = Service({"fake-arm": harness.runtime}, {"client-token": CLIENT}, "boot-00000001", limits)
+        with serving(service) as url:
+            monkeypatch.setenv("HOMUNCULUS_HOME", str(tmp_path / "home"))
+            store = TargetStore()
+            store.connect(url, "client-token")
+            store.save()
+            assert cli_main(["--json", "video", "front"]) == 0
+            link = VideoLink.model_validate_json(capsys.readouterr().out)
+            assert (link.camera, link.fps, link.expires_in_s) == ("front", 50.0, 600.0)
+            assert link.url.startswith(f"{url}/v1/robots/fake-arm/video?camera=front&until=")
 
-        with httpx.stream("GET", link.url, timeout=10) as watching:  # no token: the link lets it in
-            assert watching.status_code == 200
-            assert watching.headers["content-type"] == "multipart/x-mixed-replace; boundary=frame"
-            parts = video_parts(watching.iter_bytes())  # kept to the end: dropping it closes the connection
-            assert [next(parts) for _ in range(3)] == [("image/png", f"front {n}".encode()) for n in (1, 2, 3)]
-            with httpx.stream("GET", link.url, timeout=10) as second:
-                assert second.status_code == 503  # the one viewer allowed is watching
-            assert next(parts) == ("image/png", b"front 4")  # and goes on watching
-        assert eventually(lambda: service.viewers == 0)  # a viewer that leaves gives its place back
+            with httpx.stream("GET", link.url, timeout=10) as watching:  # no token: the link lets it in
+                assert watching.status_code == 200
+                assert watching.headers["content-type"] == "multipart/x-mixed-replace; boundary=frame"
+                parts = video_parts(watching.iter_bytes())  # kept to the end: dropping it closes the connection
+                assert [next(parts) for _ in range(3)] == [("image/png", f"front {n}".encode()) for n in (1, 2, 3)]
+                with httpx.stream("GET", link.url, timeout=10) as second:
+                    assert second.status_code == 503  # the one viewer allowed is watching
+                assert next(parts) == ("image/png", b"front 4")  # and goes on watching
+            assert eventually(lambda: service.viewers == 0)  # a viewer that leaves gives its place back
 
 
 def test_observe_saves_the_robots_camera_images_and_says_how_each_was_taken(tmp_path, monkeypatch, capsys):
     """An agent gets a file it can open, not a handle no command takes. A spectator camera is never recorded."""
-    harness = Harness(tmp_path / "journal.sqlite", "fake-arm", backend=Filmed)
-    service = Service({"fake-arm": harness.runtime}, {"client-token": CLIENT}, "boot-00000001", ServiceLimits())
-    with serving(service) as url:
-        monkeypatch.setenv("HOMUNCULUS_HOME", str(tmp_path / "home"))
-        store = TargetStore()
-        store.connect(url, "client-token")
-        store.save()
+    with Harness(tmp_path / "journal.sqlite", "fake-arm", backend=Filmed) as harness:
+        service = Service({"fake-arm": harness.runtime}, {"client-token": CLIENT}, "boot-00000001", ServiceLimits())
+        with serving(service) as url:
+            monkeypatch.setenv("HOMUNCULUS_HOME", str(tmp_path / "home"))
+            store = TargetStore()
+            store.connect(url, "client-token")
+            store.save()
 
-        assert cli_main(["--json", "observe", "--camera", "wrist", "--camera", "front"]) == 0
-        printed = json.loads(capsys.readouterr().out)
-        files = [Path(image.pop("file")) for image in printed["images"]]
-        observation = Observation.model_validate(printed)
-        assert [image.sensor for image in observation.images] == ["wrist", "front"]
-        assert all(path.parent == tmp_path / "home" / "images" for path in files)
-        assert [path.read_bytes() for path in files] == [b"wrist 1", b"front 2"]
-        assert observation.images[0].camera_pose.position_m == [0.0, 0.0, 1.0]
+            assert cli_main(["--json", "observe", "--camera", "wrist", "--camera", "front"]) == 0
+            printed = json.loads(capsys.readouterr().out)
+            files = [Path(image.pop("file")) for image in printed["images"]]
+            observation = Observation.model_validate(printed)
+            assert [image.sensor for image in observation.images] == ["wrist", "front"]
+            assert all(path.parent == tmp_path / "home" / "images" for path in files)
+            assert [path.read_bytes() for path in files] == [b"wrist 1", b"front 2"]
+            assert observation.images[0].camera_pose.position_m == [0.0, 0.0, 1.0]
 
-        assert cli_main(["observe", "--camera", "wrist", "--save", str(tmp_path / "shots")]) == 0
-        text = capsys.readouterr().out
-        assert f"image wrist rgb 1x1 image/png: {tmp_path / 'shots'}" in text
-        assert "lens [1, 1] px focal, centre [0.5, 0.5] px; camera at [0, 0, 1] m" in text
+            assert cli_main(["observe", "--camera", "wrist", "--save", str(tmp_path / "shots")]) == 0
+            text = capsys.readouterr().out
+            assert f"image wrist rgb 1x1 image/png: {tmp_path / 'shots'}" in text
+            assert "lens [1, 1] px focal, centre [0.5, 0.5] px; camera at [0, 0, 1] m" in text
 
-        assert cli_main(["observe", "--camera", "gallery"]) != 0
-        assert "'gallery' is for people watching its live video" in capsys.readouterr().err
-        assert cli_main(["describe"]) == 0
-        described = capsys.readouterr().out
-        assert "cameras     front (live video, 50 fps), wrist" in described
-        assert "spectators  gallery (live video, 50 fps)" in described
+            assert cli_main(["observe", "--camera", "gallery"]) != 0
+            assert "'gallery' is for people watching its live video" in capsys.readouterr().err
+            assert cli_main(["describe"]) == 0
+            described = capsys.readouterr().out
+            assert "cameras     front (live video, 50 fps), wrist" in described
+            assert "spectators  gallery (live video, 50 fps)" in described
 
 
 def test_the_task_states_its_camera_as_mujoco_does_once_converted(panda):
@@ -1545,77 +1564,85 @@ def test_the_task_states_its_camera_as_mujoco_does_once_converted(panda):
 
 def test_a_viewer_who_leaves_before_the_first_frame_gives_its_place_back(tmp_path, monkeypatch):
     """Otherwise each such viewer would hold a place until the service restarts."""
-    harness = Harness(tmp_path / "journal.sqlite", "fake-arm", backend=Filmed)
-    service = Service({"fake-arm": harness.runtime}, {"client-token": CLIENT}, "boot-00000001", ServiceLimits())
-    left, capture = threading.Event(), harness.backend.capture
+    with Harness(tmp_path / "journal.sqlite", "fake-arm", backend=Filmed) as harness:
+        service = Service({"fake-arm": harness.runtime}, {"client-token": CLIENT}, "boot-00000001", ServiceLimits())
+        left, capture = threading.Event(), harness.backend.capture
 
-    def held(sensor: str) -> list[Frame]:
-        left.wait(10)  # the first frame is still being captured when the viewer leaves
-        return capture(sensor)
+        def held(sensor: str) -> list[Frame]:
+            left.wait(10)  # the first frame is still being captured when the viewer leaves
+            return capture(sensor)
 
-    monkeypatch.setattr(harness.backend, "capture", held)
-    until = int(time.time()) + 60
-    query = httpx.QueryParams(
-        camera="front", until=until, signature=service.video_signature("fake-arm", "front", until)
-    )
-    with serving(service) as url:
-        viewer = socket.create_connection(("127.0.0.1", int(url.rsplit(":", 1)[1])))
-        viewer.sendall(f"GET /v1/robots/fake-arm/video?{query} HTTP/1.1\r\nHost: robot\r\n\r\n".encode())
-        assert eventually(lambda: service.viewers == 1)
-        viewer.close()
-        time.sleep(0.2)  # for the service to see the connection end
-        left.set()
-        assert eventually(lambda: service.viewers == 0)
+        monkeypatch.setattr(harness.backend, "capture", held)
+        until = int(time.time()) + 60
+        query = httpx.QueryParams(
+            camera="front", until=until, signature=service.video_signature("fake-arm", "front", until)
+        )
+        with serving(service) as url:
+            with socket.create_connection(("127.0.0.1", int(url.rsplit(":", 1)[1]))) as viewer:
+                viewer.sendall(f"GET /v1/robots/fake-arm/video?{query} HTTP/1.1\r\nHost: robot\r\n\r\n".encode())
+                assert eventually(lambda: service.viewers == 1)
+            time.sleep(0.2)  # the viewer has left; this is for the service to see the connection end
+            left.set()
+            assert eventually(lambda: service.viewers == 0)
 
 
 def test_a_video_that_cannot_play_is_refused_with_the_reason(tmp_path, monkeypatch):
     """A browser shows the refusal, so a video that will not play never looks like a blank one."""
-    harness = Harness(tmp_path / "journal.sqlite", "fake-arm", backend=Filmed)
-    service = Service({"fake-arm": harness.runtime}, {"client-token": CLIENT}, "boot-00000001", ServiceLimits())
-    robot = "/v1/robots/fake-arm"
-    with serving(service) as url, httpx.Client(base_url=url, timeout=10) as http:
-        no_token = http.get(f"{robot}/video-link", params={"camera": "front"})
-        assert no_token.json()["error"]["code"] == "unauthenticated"
-        client = {"Authorization": "Bearer client-token"}
-        snapshots = http.get(f"{robot}/video-link", params={"camera": "wrist"}, headers=client).json()["error"]
-        assert snapshots["code"] == "unsupported_sensor"
-        assert "takes snapshots only" in snapshots["message"] and "each capture spends a budget" in snapshots["message"]
-        absent = http.get(f"{robot}/video-link", params={"camera": "rear"}, headers=client).json()["error"]
-        assert (absent["code"], absent["details"]["cameras"]) == ("unsupported_sensor", ["front", "gallery", "wrist"])
+    with Harness(tmp_path / "journal.sqlite", "fake-arm", backend=Filmed) as harness:
+        service = Service({"fake-arm": harness.runtime}, {"client-token": CLIENT}, "boot-00000001", ServiceLimits())
+        robot = "/v1/robots/fake-arm"
+        with serving(service) as url, httpx.Client(base_url=url, timeout=10) as http:
+            no_token = http.get(f"{robot}/video-link", params={"camera": "front"})
+            assert no_token.json()["error"]["code"] == "unauthenticated"
+            client = {"Authorization": "Bearer client-token"}
+            snapshots = http.get(f"{robot}/video-link", params={"camera": "wrist"}, headers=client).json()["error"]
+            assert snapshots["code"] == "unsupported_sensor"
+            assert (
+                "takes snapshots only" in snapshots["message"]
+                and "each capture spends a budget" in snapshots["message"]
+            )
+            absent = http.get(f"{robot}/video-link", params={"camera": "rear"}, headers=client).json()["error"]
+            assert (absent["code"], absent["details"]["cameras"]) == (
+                "unsupported_sensor",
+                ["front", "gallery", "wrist"],
+            )
 
-        def refusal(camera: str, until: int, signature: str) -> dict:
-            """Why a link does not play. One that plays fails the test instead of streaming forever."""
-            query = {"camera": camera, "until": until, "signature": signature}
-            with http.stream("GET", f"{robot}/video", params=query) as response:
-                assert response.status_code != 200, "this link should not play"
-                response.read()
-                return response.json()["error"]
+            def refusal(camera: str, until: int, signature: str) -> dict:
+                """Why a link does not play. One that plays fails the test instead of streaming forever."""
+                query = {"camera": camera, "until": until, "signature": signature}
+                with http.stream("GET", f"{robot}/video", params=query) as response:
+                    assert response.status_code != 200, "this link should not play"
+                    response.read()
+                    return response.json()["error"]
 
-        until = int(time.time()) + 60
-        signature = service.video_signature("fake-arm", "front", until)
-        assert refusal("wrist", until, signature)["code"] == "unauthenticated"  # made for another camera
-        assert refusal("front", until + 600, signature)["code"] == "unauthenticated"  # its time moved on
-        earlier = Service({"fake-arm": harness.runtime}, {}, "boot-00000000", ServiceLimits())  # restarted since
-        assert refusal("front", until, earlier.video_signature("fake-arm", "front", until))["code"] == "unauthenticated"
-        past = int(time.time()) - 1
-        expired = refusal("front", past, service.video_signature("fake-arm", "front", past))
-        assert (expired["code"], "expired" in expired["message"]) == ("unauthenticated", True)
-        # Signed or not, a camera that takes snapshots only has no video to play.
-        assert refusal("wrist", until, service.video_signature("fake-arm", "wrist", until))["code"] == (
-            "unsupported_sensor"
-        )
+            until = int(time.time()) + 60
+            signature = service.video_signature("fake-arm", "front", until)
+            assert refusal("wrist", until, signature)["code"] == "unauthenticated"  # made for another camera
+            assert refusal("front", until + 600, signature)["code"] == "unauthenticated"  # its time moved on
+            earlier = Service({"fake-arm": harness.runtime}, {}, "boot-00000000", ServiceLimits())  # restarted since
+            assert (
+                refusal("front", until, earlier.video_signature("fake-arm", "front", until))["code"]
+                == "unauthenticated"
+            )
+            past = int(time.time()) - 1
+            expired = refusal("front", past, service.video_signature("fake-arm", "front", past))
+            assert (expired["code"], "expired" in expired["message"]) == ("unauthenticated", True)
+            # Signed or not, a camera that takes snapshots only has no video to play.
+            assert refusal("wrist", until, service.video_signature("fake-arm", "wrist", until))["code"] == (
+                "unsupported_sensor"
+            )
 
-        # A camera that cannot capture is refused before the response begins, and takes no viewer's place.
-        def unplugged(sensor: str) -> list[Frame]:
-            raise RobotError("backend_error", f"camera {sensor!r} is unplugged")
+            # A camera that cannot capture is refused before the response begins, and takes no viewer's place.
+            def unplugged(sensor: str) -> list[Frame]:
+                raise RobotError("backend_error", f"camera {sensor!r} is unplugged")
 
-        monkeypatch.setattr(harness.backend, "capture", unplugged)
-        failed = refusal("front", until, signature)
-        assert (failed["code"], failed["message"], service.viewers) == (
-            "backend_error",
-            "camera 'front' is unplugged",
-            0,
-        )
+            monkeypatch.setattr(harness.backend, "capture", unplugged)
+            failed = refusal("front", until, signature)
+            assert (failed["code"], failed["message"], service.viewers) == (
+                "backend_error",
+                "camera 'front' is unplugged",
+                0,
+            )
 
 
 @pytest.fixture
@@ -1628,18 +1655,23 @@ def panda(tmp_path) -> Iterator[Harness]:
     pytest.importorskip("mujoco")
     from homunculus.backends.mujoco import MujocoBackend
 
-    harness = Harness(tmp_path / "sim.sqlite", "panda", backend=lambda clock: MujocoBackend(clock, rigs.find("panda")))
-    with harness.backend:
-        yield harness
+    with Harness(
+        tmp_path / "sim.sqlite", "panda", backend=lambda clock: MujocoBackend(clock, rigs.find("panda"))
+    ) as sim:
+        yield sim
 
 
-def test_the_fake_arm_is_the_simulated_panda_without_physics(tmp_path, panda):
-    fake, sim = Harness(tmp_path / "fake.sqlite", "arm"), panda
+def test_the_fake_arm_is_the_simulated_panda_without_physics(arm, panda):
+    fake, sim = arm, panda
 
     def ranges(harness: Harness) -> tuple[list[tuple[str, float, float]], float, float]:
         limits = {binding.profile: binding.limits for binding in harness.runtime.describe().profiles}
         arm, gripper = limits["joints.trajectory/1"], limits["gripper.width/1"]
-        return [(j.name, j.min_position, j.max_position) for j in arm.joints], gripper.min_width_m, gripper.max_width_m
+        return (
+            [(j.name, j.min_position, j.max_position) for j in arm.joints],
+            gripper.min_width_m,
+            gripper.max_width_m,
+        )
 
     assert ranges(fake) == ranges(sim)
     start = [harness.runtime.observe().samples["arm"].values["positions"] for harness in (fake, sim)]
