@@ -20,6 +20,42 @@ enough. The result also says what the robot holds afterwards.
 
 This is a prototype. **It has never been connected to a physical robot.**
 
+### What the agent sees
+
+`homunculus observe --camera NAME` saves each camera image as a file the agent opens and looks at. The file
+comes with the lens and the camera's pose in the world, so a pixel can be turned into a ray and a point
+into a pixel. These are images saved that way from three published robot models in MuJoCo, mounted the
+way they would be on real hardware:
+
+<table>
+  <tr>
+    <td width="33%"><img src="docs/images/panda-wrist.jpg" alt="Panda wrist camera looking down into a teal mug between its open fingers"></td>
+    <td width="33%"><img src="docs/images/so101-wrist.jpg" alt="SO-101 wrist camera: a green figure and a pale plate on a desk, the yellow jaw at the bottom"></td>
+    <td width="33%"><img src="docs/images/ur5e-realsense.jpg" alt="RealSense view of a UR5e lowered over a plate, with a patterned mug and a toy bee"></td>
+  </tr>
+  <tr>
+    <td><b>Franka Panda</b>, <code>wrist</code>: over the mug before a grasp</td>
+    <td><b>SO-101</b>, <code>wrist_cam</code>: a figure and a plate</td>
+    <td><b>UR5e</b>, seen by a fixed <b>Intel RealSense D435i</b>: the tool over the plate</td>
+  </tr>
+</table>
+
+The same commands drove all three; only the backend arguments changed. Is the reported camera
+information right? For 15 objects across these cameras, each object's true centre was projected using
+only the lens and pose the CLI reported, and checked against a segmentation render: **15 of 15 landed
+on their object.**
+
+<p align="center">
+  <img src="docs/images/panda-workspace-check.jpg" width="60%" alt="Panda workspace camera with crosshairs marking the projected centres of a bowl and a mug, each on its object">
+</p>
+
+The Panda scene ships with homunculus (`--backend mujoco`). The SO-101 and UR5e scenes (desk, bench,
+camera pole, objects) were written for these images and are not in this repository yet. Robots and
+camera: [MuJoCo Menagerie](https://github.com/google-deepmind/mujoco_menagerie/tree/370c43965323c0944b433b202aac5058b5f907a9),
+each under its own license. Objects: [Google Scanned Objects](https://github.com/kevinzakka/mujoco_scanned_objects/tree/6ff8d275cebfd5b47e49685e3cfbe64b20e49a3c)
+(CC BY 4.0, Downie et al., ICRA 2022). The green figure is the scan in that collection's
+`Great_Dinos_Triceratops_Toy` folder, which is actually an Android figure.
+
 ## Backends
 
 | Backend | Robots | What a result shows |
@@ -39,6 +75,10 @@ Needs Python 3.10 or newer and [uv](https://docs.astral.sh/uv/). No ROS, GPU, ro
 credentials.
 
 ```sh
+# from GitHub, with the MuJoCo backend:
+uv tool install "homunculus[mujoco] @ git+https://github.com/kyle-compute/homunculus"
+
+# or from a checkout:
 uv build --wheel
 uv tool install dist/homunculus-0.1.0-py3-none-any.whl
 
