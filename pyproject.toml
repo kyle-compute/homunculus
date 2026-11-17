@@ -1,0 +1,45 @@
+[project]
+name = "homunculus"
+dynamic = ["version"]
+description = "Prototype CLI, Python client, and local service for one robot control API across fake, simulated, and task backends."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "fastapi>=0.115",
+    "httpx>=0.27",
+    "pydantic>=2.9",
+    "uvicorn>=0.30",
+]
+
+[project.optional-dependencies]
+# Needed only for `homunculus demo start --backend mujoco` / `homunculus serve --backend mujoco`. Pillow encodes JPEG.
+mujoco = ["mujoco>=3.2", "pillow>=10"]
+
+[project.scripts]
+homunculus = "homunculus.cli:main"
+hom = "homunculus.cli:main"
+
+[dependency-groups]
+# anyio arrives with fastapi and httpx. The contract test imports it directly, to make the service's
+# shared workers scarce.
+dev = ["anyio>=3.4", "pytest>=8", "ruff>=0.17"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.version]
+path = "src/homunculus/__init__.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/homunculus"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "SIM", "RET"]

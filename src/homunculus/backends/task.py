@@ -1,0 +1,977 @@
+"""Adapter for one downloaded benchmark task, driven through the task's own simulator.
+
+The task's source, physics, assets, and verifier stay where they were
+downloaded; nothing is copied or modified. Either this module starts the task's
+unchanged simulator entry point with an interpreter the user supplies, or it
+attaches to that simulator already running, as the task's own containers run
+it. It maps four profiles onto the motor controls the simulator offers over HTTP:
+
+    base.planar_velocity/1 (timed goal)   ->  repeated `step` actions with base_velocity,
+                                              judged against the base velocity the task measures
+    gripper.width/1 on the left gripper   ->  one `grip` action
+    tool.pose.linear/1 on either hand     ->  repeated `step` actions with a hand target moving along
+                                              the straight segment, judged against the measured tool site
+    hand.posture/1 on the right hand      ->  one `grip` action to the opening the posture names
+
+The task's world is stepped: physics advances only while an action runs. The
+simulator records every physics step in its state directory, and that record
+is what the task's verifier replays.
+
+Written against, and run only with, `g1-dining-salt-mill`. The limits and state
+fields below are that task's; another task works only if its simulator offers
+the same controls.
+"""
+
+from __future__ import annotations
+
+import base64
+import json
+import logging
+import math
+import os
+import queue
+import socket
+import subprocess
+import threading
+import time
+from collections.abc import Callable, Sequence
+from pathlib import Path
+from typing import Any
+
+import httpx
+
+from ..models import (
+    BackendInfo,
+    BaseVelocityGoal,
+    BaseVelocityLimits,
+    CameraImage,
+    ClockInfo,
+    Contract,
+    GripperWidthGoal,
+    GripperWidthLimits,
+    HandPostureGoal,
+    HandPostureLimits,
+    Pose,
+    ProfileBinding,
+    RobotError,
+    Sample,
+    SensorInfo,
+    ToolPoseGoal,
+    ToolPoseLimits,
+)
+from ..profiles import ActivityStatus, PoseJudge, PostureJudge, VelocityJudge, WidthJudge
+from ..runtime import Backend, BackendFacts, Feedback, Frame, ResourceSpec, StartupError
+
+log = logging.getLogger(__name__)
+
+CAMERAS = ("head", "eyes", "left_wrist", "right_wrist")
+# Bounds the task's own `step` and `grip` actions enforce, restated here for admission.
+STEP_MIN_S, STEP_MAX_S = 0.02, 0.25
+MAX_GAP_M = 0.10
+# Standstill is measured, not assumed: the task must report a stable stand (both feet loaded, upright,
+# slow), or a gap that changes less than GAP_STILL_M per step, for SETTLE_S within SETTLE_LIMIT_S.
+SETTLE_S, SETTLE_STEP_S, SETTLE_LIMIT_S = 0.2, 0.05, 4.0
+GAP_STILL_M = 0.0002
+# The arms and right fingers count as at rest when they move less than this per settle step.
+TOOL_STILL_M, FINGER_STILL_RAD = 0.0005, 0.002
+# A pose goal sends the moving hand target this often; the task's own scripted moves use 0.1 s steps.
+POSE_STEP_S = 0.1
+SIDES = ("left", "right")
+ARM_JOINTS = {
+    side: [
+        f"{side}_{part}_joint"
+        for part in (
+            "shoulder_pitch",
+            "shoulder_roll",
+            "shoulder_yaw",
+            "elbow",
+            "wrist_roll",
+            "wrist_pitch",
+            "wrist_yaw",
+        )
+    ]
+    for side in SIDES
+}
+# The right hand's finger angles for each posture. "open" is the task's finger targets at opening 1 (humanoid.py
+# finger_targets), reached within 0.016 rad by a hand clear of the body. "closed" is measured, not the task's
+# opening-0 targets: closing an empty hand stops on finger-to-finger contact (38-40 N) about 0.27 rad short of
+# them. These are its angles over three closures on Modal, 2026-11-16, which agreed within 0.027 rad.
+RIGHT_POSTURES = {
+    "open": {
+        "thumb_0": -0.55,
+        "thumb_1": -0.15,
+        "thumb_2": 0.0,
+        "middle_0": 0.0,
+        "middle_1": 0.0,
+        "index_0": 0.0,
+        "index_1": 0.0,
+    },
+    "closed": {
+        "thumb_0": -0.60,
+        "thumb_1": -0.72,
+        "thumb_2": -1.24,
+        "middle_0": 1.095,
+        "middle_1": 1.449,
+        "index_0": 0.85,
+        "index_1": 1.40,
+    },
+}
+POSTURE_OPENING = {"open": 1.0, "closed": 0.0}
+# Hand pose goals. The workspace and speeds are the bounds the task's own hand controls enforce. The
+# tolerances were checked against 48 free-space goals on Modal: see docs/guide.md.
+POSE_LIMITS = {
+    "profile": "tool.pose.linear/1",
+    "frames": ["world"],
+    "workspace_min_m": [-2.85, -2.85, 0.55],
+    "workspace_max_m": [2.85, 2.85, 1.35],
+    "min_speed_m_s": 0.01,
+    "max_speed_m_s": 0.20,
+    "default_speed_m_s": 0.08,
+    "max_rotation_rate_rad_s": 0.5,
+    "path_tolerance_m": 0.05,
+    "position_tolerance_m": 0.01,
+    "max_position_tolerance_m": 0.05,
+    "orientation_tolerance_rad": 0.08,
+    "max_orientation_tolerance_rad": 0.3,
+    "settle_time_s": SETTLE_S,
+    "max_settle_wait_s": 3.0,
+}
+# How base travel is verified, qualified on recorded free and blocked walks of this task's walking policy.
+# Velocity is averaged over one 0.75 s gait cycle; anything
+# shorter mostly measures sway. Over that window the policy delivered 40-125 % of each commanded component
+# when free and at most 22 % against an obstacle, and it stands instead of walking below 0.05.
+TRACKING = {
+    "transient_s": 1.0,
+    "max_tracking_error_m_s": 0.05,
+    "max_tracking_error_rad_s": 0.12,
+    "max_tracking_error_ratio": 0.7,
+    "max_tracking_error_duration_s": 0.75,
+    "tracking_window_s": 0.75,
+}
+ZERO_VELOCITY = {"forward_m_s": 0.0, "left_m_s": 0.0, "yaw_rate_rad_s": 0.0}
+# Passed through to the simulator when set: the task's own settings, and what its libraries need.
+SIMULATOR_ENV = ("SCENE_SEED", "POSE_JITTER", "RENDER_BACKEND", "MUJOCO_GL", "PATH", "TMPDIR")
+
+
+def robots(
+    task_dir: str | None = None,
+    python: str | None = None,
+    state_dir: str | None = None,
+    url: str | None = None,
+    name: str | None = None,
+) -> dict[str, Backend]:
+    """The robot `--backend task` serves.
+
+    To start the simulator: `task_dir`, the downloaded task; `python`, an interpreter with the task's own
+    requirements; `state_dir`, a new directory for the recorded episode. Paths are made absolute but keep
+    their symlinks: a virtual environment's interpreter is a symlink, and resolving it would select the base
+    interpreter.
+
+    To attach to a simulator that is already running, such as the task's own simulator container: `url`, where
+    it listens, and `name`, the task's name. That simulator records the episode in its own state directory.
+    """
+    if url is not None:
+        if task_dir or python or state_dir or not name:
+            raise StartupError(
+                "give url and name to attach to a running simulator, or task_dir, python and state_dir to start one"
+            )
+        task = TaskBackend(name, url.rstrip("/"), epoch=url.rstrip("/"))
+        return {f"task-{task.name}": task}
+    if not (task_dir and python and state_dir) or name:
+        raise StartupError(
+            "give task_dir, python and state_dir to start the simulator, or url and name to attach to one"
+        )
+    task_path, python_path, state_path = (
+        Path(os.path.abspath(Path(v).expanduser())) for v in (task_dir, python, state_dir)
+    )
+    process, url = _start_simulator(task_path, python_path, state_path)
+    try:
+        task = TaskBackend(task_path.name, url, epoch=str(state_path), process=process, state_dir=state_path)
+    except BaseException:  # including an interrupted start: the simulator must not outlive this service
+        process.kill()
+        raise
+    return {f"task-{task.name}": task}
+
+
+def _start_simulator(task_dir: Path, python: Path, state_dir: Path) -> tuple[subprocess.Popen[bytes], str]:
+    """Start the task's own simulator entry point recording into state_dir; return it and its URL."""
+    entry = task_dir / "environment" / "simulator" / "start.py"
+    if not entry.is_file():
+        raise StartupError(f"{task_dir} is not a task with a simulator: {entry} does not exist")
+    if not python.is_file():
+        raise StartupError(
+            f"the task interpreter {python} (option python) does not exist; docs/guide.md shows how to create it"
+        )
+    if (state_dir / "episode.json").exists() or (state_dir / "trajectory").exists():
+        raise StartupError(f"{state_dir} already holds a recording; choose a new state_dir")
+    state_dir.mkdir(parents=True, exist_ok=True)
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
+    # The same entry point the task's own container runs, isolated from this environment and
+    # told not to write bytecode into the downloaded tree. It records into state_dir only.
+    # Downloaded code gets the settings it reads, not the whole environment of this service.
+    settings = {name: os.environ[name] for name in SIMULATOR_ENV if name in os.environ}
+    with open(state_dir / "simulator.log", "w") as output:
+        process = subprocess.Popen(
+            [str(python), "-I", "-B", str(entry)],
+            cwd=state_dir,
+            env={**settings, "STATE_DIR": str(state_dir), "SIM_PORT": str(port)},
+            stdout=output,
+            stderr=subprocess.STDOUT,
+            stdin=subprocess.DEVNULL,
+        )
+    return process, f"http://127.0.0.1:{port}"
+
+
+class _Refused(Exception):
+    """The task simulator rejected an action (finished episode, exhausted budget, fallen robot)."""
+
+
+class TaskBackend(Backend):
+    def __init__(
+        self,
+        name: str,
+        url: str,
+        *,
+        epoch: str,
+        process: subprocess.Popen[bytes] | None = None,
+        state_dir: Path | None = None,
+    ):
+        """`process` and `state_dir` are the simulator this service started; None when it attached to one."""
+        self.name = name
+        self._epoch = epoch  # names this episode on the task_sim clock
+        self._process, self._state_dir = process, state_dir
+        # trust_env=False: the simulator is on loopback, never behind a proxy the environment names.
+        self._http = httpx.Client(base_url=url, timeout=300.0, trust_env=False)
+
+        self._lock = threading.Lock()  # guards everything below, shared by the worker and the control thread
+        self._robot: dict[str, Any] = {}
+        self._sim_time = 0.0
+        self._task: dict[str, Any] = {}
+        self._finished = False
+        self._reachable = False  # true while the simulator's latest answer was a successful one
+        self._activities: dict[str, ActivityStatus] = {}
+        self._owner: dict[str, str] = {}  # resource id -> activity commanding it
+        self._cancelled: set[str] = set()
+        try:
+            self._wait_until_ready()
+            self._record(self._http.get("/state").json())
+            self._revisions = {"task": self.name, "simulator": url}
+            if state_dir is not None:
+                self._revisions["scene_seed"] = str(json.loads((state_dir / "seed.json").read_text())["seed"])
+                self._revisions["state_dir"] = str(state_dir)
+            hands = self._robot["hands"]
+            # What each hand's controller holds while no goal commands it: where it was measured at start.
+            self._hand_target = {side: _tool_pose(hands[side]) for side in SIDES}
+            # Per resource: measured at rest under the fallback. The world is stepped, so before the first
+            # action nothing is in motion; the base still has to be measured standing.
+            self._settled = {
+                "base": bool(self._robot["support"]["stable"]),
+                "left_gripper": True,
+                "left_arm": True,
+                "right_arm": True,
+                "right_hand": True,
+            }
+            self.advance()  # fails here, not later, if this task reports a different robot state
+        except (KeyError, TypeError, ValueError) as error:
+            raise StartupError(
+                f"the simulator of {self.name} does not report the robot state this adapter maps "
+                f"({type(error).__name__}: {error}); it was written for g1-dining-salt-mill"
+            ) from None
+        # Simulator actions block for as long as their physics takes, so one worker runs them in order.
+        self._commands: queue.Queue[Callable[[], None] | None] = queue.Queue()
+        self._worker = threading.Thread(target=self._work, name=f"task:{self.name}", daemon=True)
+        self._worker.start()
+
+    def _alive(self) -> bool:
+        """Whether the simulator can still answer: a started process has not exited (an attached one is assumed
+        up, and reachability shows otherwise)."""
+        return self._process is None or self._process.poll() is None
+
+    def _wait_until_ready(self) -> None:
+        deadline = time.monotonic() + 180.0
+        while True:
+            if not self._alive() or time.monotonic() > deadline:
+                if self._state_dir is None:
+                    raise StartupError(f"the task simulator at {self._http.base_url} did not answer /health in time")
+                tail = (self._state_dir / "simulator.log").read_text(errors="replace")[-1500:]
+                raise StartupError(f"the task simulator did not start; its log ends with:\n{tail}")
+            try:
+                if self._http.get("/health", timeout=2.0).json().get("ready"):
+                    return
+            except (httpx.TransportError, ValueError):
+                pass
+            time.sleep(0.2)
+
+    # -- what the runtime asks --------------------------------------------
+
+    def describe(self) -> BackendFacts:
+        with self._lock:
+            finished, alive = self._finished, self._alive()
+        reason = None
+        if finished:
+            reason = "the episode is finished; a new episode needs a new simulator and a new service"
+        elif not alive:
+            reason = "the task simulator process is not running"
+        common = {"modes": ["goal"], "available": reason is None, "unavailable_reason": reason}
+        return BackendFacts(
+            info=BackendInfo(
+                kind="task",
+                physics="simulated",
+                notice=(
+                    f"Downloaded task {self.name!r} running its own unchanged MuJoCo simulator. "
+                    "Results are simulated physics, not a physical robot."
+                ),
+            ),
+            world_id=f"{self.name}:{self._epoch}",
+            mode="task_episode",
+            clock_mode="stepped",
+            clocks=[
+                ClockInfo(
+                    id="task_sim",
+                    epoch=self._epoch,
+                    description="the task simulator's time since episode start; it advances only while an action runs",
+                )
+            ],
+            frames=["world", "base_heading"],
+            sensors=[
+                SensorInfo(
+                    id="base",
+                    kind="base_state",
+                    provenance="simulation_ground_truth",
+                    description="base pose [x, y, yaw], pelvis height, foot support, and balance state from the task",
+                ),
+                SensorInfo(
+                    id="left_gripper",
+                    kind="joint_state",
+                    provenance="simulation_ground_truth",
+                    description="measured gap of the left parallel gripper and its contact force",
+                ),
+                *(
+                    SensorInfo(
+                        id=f"{side}_arm",
+                        kind="joint_state",
+                        provenance="simulation_ground_truth",
+                        description=f"{side} arm joint angles and the measured pose of its {side}_tool site",
+                    )
+                    for side in SIDES
+                ),
+                SensorInfo(
+                    id="right_hand",
+                    kind="joint_state",
+                    provenance="simulation_ground_truth",
+                    description="right hand finger joint angles and their contact force",
+                ),
+                SensorInfo(
+                    id="task",
+                    kind="task_state",
+                    provenance="simulation_ground_truth",
+                    description="hand poses, remaining budgets, and whether the episode is finished",
+                ),
+                *(
+                    SensorInfo(
+                        id=camera,
+                        kind="camera",
+                        provenance="simulation_ground_truth",
+                        description="rendered 960x720 RGB and metric depth; each capture uses the task's budget of 300",
+                    )
+                    for camera in CAMERAS
+                ),
+            ],
+            revisions=dict(self._revisions),
+            resources=[
+                ResourceSpec(id="base", role="mobile_base", joints=[], controller="task locomotion policy"),
+                ResourceSpec(
+                    id="left_gripper",
+                    role="left_gripper",
+                    joints=["left_jaw_a", "left_jaw_b"],
+                    controller="task gripper controller",
+                ),
+                *(
+                    ResourceSpec(
+                        id=f"{side}_arm", role=f"{side}_arm", joints=ARM_JOINTS[side], controller="task arm controller"
+                    )
+                    for side in SIDES
+                ),
+                ResourceSpec(
+                    id="right_hand",
+                    role="right_hand",
+                    joints=[f"right_hand_{part}_joint" for part in RIGHT_POSTURES["open"]],
+                    controller="task finger controller",
+                ),
+            ],
+            bindings=[
+                ProfileBinding(
+                    profile="base.planar_velocity/1",
+                    target="base",
+                    role="mobile_base",
+                    resources=["base"],
+                    controller="task locomotion policy",
+                    assistance=(
+                        "the task's learned walking policy keeps balance and follows the velocity loosely; travel is "
+                        "verified against base velocity measured over one gait cycle, so a blocked base fails"
+                    ),
+                    stop_deadline_wall_s=15.0,
+                    limits=BaseVelocityLimits(
+                        profile="base.planar_velocity/1",
+                        control_point="pelvis",  # the body whose position and heading the task reports as the base
+                        frames=["base_heading"],
+                        max_forward_m_s=0.35,
+                        max_left_m_s=0.25,
+                        max_yaw_rate_rad_s=0.5,
+                        max_goal_duration_s=10.0,
+                        **TRACKING,
+                        stop_speed_m_s=0.08,
+                        stop_yaw_rate_rad_s=0.25,
+                        settle_time_s=SETTLE_S,
+                    ),
+                    **common,
+                ),
+                ProfileBinding(
+                    profile="gripper.width/1",
+                    target="left_gripper",
+                    role="left_gripper",
+                    resources=["left_gripper"],
+                    controller="task gripper controller",
+                    assistance="the task ramps the jaw opening over one simulated second; grasping is by contact only",
+                    stop_deadline_wall_s=15.0,
+                    limits=GripperWidthLimits(
+                        profile="gripper.width/1",
+                        min_width_m=0.0,
+                        max_width_m=MAX_GAP_M,
+                        speed_m_s=MAX_GAP_M,
+                        goal_tolerance_m=0.003,
+                        settle_time_s=SETTLE_S,
+                        # The task reports a contact force, but no qualified contact rule exists for it.
+                        complete_on=["width_reached"],
+                    ),
+                    **common,
+                ),
+                *(
+                    ProfileBinding(
+                        profile="tool.pose.linear/1",
+                        target=f"{side}_hand",
+                        role=f"{side}_arm",
+                        resources=[f"{side}_arm"],
+                        controller="task arm controller",
+                        assistance=(
+                            "the task's whole-arm inverse kinematics follows the moving hand target and avoids "
+                            "self-collision; it does not plan around the scene, and the hand target stays fixed in "
+                            "the world when the base walks"
+                        ),
+                        stop_deadline_wall_s=15.0,
+                        limits=ToolPoseLimits(**POSE_LIMITS, control_point=f"{side}_tool"),
+                        **common,
+                    )
+                    for side in SIDES
+                ),
+                ProfileBinding(
+                    profile="hand.posture/1",
+                    target="right_hand",
+                    role="right_hand",
+                    resources=["right_hand"],
+                    controller="task finger controller",
+                    assistance=(
+                        "the task ramps the fingers over one simulated second; closed is where an empty hand's "
+                        "fingers stop on each other; grasping is by contact only, so a hand closed on an object "
+                        "stops short of it"
+                    ),
+                    stop_deadline_wall_s=15.0,
+                    limits=HandPostureLimits(
+                        profile="hand.posture/1",
+                        postures={
+                            name: {f"right_hand_{part}_joint": angle for part, angle in joints.items()}
+                            for name, joints in RIGHT_POSTURES.items()
+                        },
+                        max_speed_rad_s=1.5,
+                        goal_tolerance_rad=0.06,
+                        settle_time_s=SETTLE_S,
+                    ),
+                    **common,
+                ),
+            ],
+            # The task could move several in one step; this adapter does not, so no combination is offered.
+            concurrent=[],
+            management=["recover"] if finished else ["episode.finish", "recover"],
+            period_s=0.05,
+        )
+
+    def apply(self, activity_id: str, contract: Contract) -> None:
+        action, rid = contract.action, contract.resources[0]
+        run: Callable[..., None] = {
+            BaseVelocityGoal: self._travel,
+            GripperWidthGoal: self._grip,
+            ToolPoseGoal: self._pose,
+            HandPostureGoal: self._posture,
+        }[type(action)]
+        with self._lock:
+            self._activities[activity_id] = ActivityStatus("executing")
+            self._owner[rid] = activity_id
+            self._settled[rid] = False
+        self._commands.put(lambda: run(activity_id, action, contract.limits))
+
+    def stop(self, resources: Sequence[str]) -> None:
+        with self._lock:
+            for rid in resources:
+                activity_id = self._owner.pop(rid, None)
+                if activity_id is not None:
+                    self._cancelled.add(activity_id)
+                    self._activities.pop(activity_id, None)
+                if not self._finished:
+                    self._settled[rid] = False  # until the fallback queued below measures rest
+            if self._finished:
+                return  # a finished episode never steps again: what was measured before it ended stands
+        self._commands.put(lambda: self._fallback(list(resources)))
+
+    def manage(self, operation: str, parameters: dict[str, Any]) -> dict[str, Any]:
+        if operation == "recover":
+            self.stop(parameters["resources"])
+            return {}
+        if operation != "episode.finish":
+            raise RobotError("unsupported_operation", f"the task adapter has no {operation}", operation=operation)
+        # Ends the episode the way the task defines it. Queued behind any action still running.
+        done = threading.Event()
+        outcome: dict[str, Any] = {}
+
+        def finish() -> None:
+            try:
+                with self._lock:
+                    moving = [rid for rid, settled in self._settled.items() if not settled]
+                if moving:
+                    # A paused world proves nothing about the motion in it. What was cut short is brought to
+                    # rest, and measured at rest, while the episode can still step.
+                    self._fallback(moving)
+                outcome["reply"] = self._act({"action": "finish"})
+            except Exception as error:  # reported to the operator below
+                outcome["error"] = str(error)
+            done.set()
+
+        with self._lock:
+            self._cancelled.update(self._owner.values())
+            self._owner.clear()
+            self._activities.clear()
+        self._commands.put(finish)
+        if not done.wait(60.0):
+            raise RobotError("backend_error", "the task simulator did not finish the episode in time")
+        if "error" in outcome:
+            raise RobotError("backend_error", f"the task simulator did not finish the episode: {outcome['error']}")
+        with self._lock:
+            return {"finished": True, "sim_time_s": self._sim_time, **self._task}
+
+    def capture(self, sensor: str) -> list[Frame]:
+        try:
+            response = self._http.get("/observe", params={"camera": sensor})
+            body = response.json()
+        except (httpx.HTTPError, ValueError) as error:
+            raise RobotError("backend_error", f"the task simulator did not answer the capture: {error}") from error
+        if response.status_code != 200:
+            raise RobotError("backend_error", f"the task simulator refused the capture: {body.get('error')}")
+        with self._lock:  # the simulator states this count only in /state; each capture spends one
+            self._task["observations_remaining"] -= 1
+        rgb, depth = _camera_image(body["metadata"], self._epoch), base64.b64decode(body["depth_npy"])
+        return [
+            Frame(rgb, base64.b64decode(body["rgb_png"])),
+            Frame(rgb.model_copy(update={"kind": "depth", "media_type": "application/x-npy"}), depth),
+        ]
+
+    def advance(self) -> Feedback:
+        """Report the simulator's latest answer. Nothing is stepped here; the worker does that."""
+        with self._lock:
+            robot, valid = self._robot, self._reachable and self._alive()
+            left, right = robot["hands"]["left"], robot["hands"]["right"]
+            x, y, yaw = robot["base_xy_yaw"]
+            support = robot["support"]
+            groups = {
+                "base": {
+                    "frame_id": "world",
+                    "positions": {"x_m": x, "y_m": y, "yaw_rad": yaw},
+                    "velocities": {
+                        "linear_speed_m_s": support["linear_speed_m_s"],
+                        "angular_speed_rad_s": support["angular_speed_rad_s"],
+                    },
+                    "pelvis_height_m": robot["pelvis_height"],
+                    "support": {"stable": support["stable"], "foot_normal_force_N": support["foot_normal_force_N"]},
+                    "fallen": robot["fallen"],
+                },
+                "left_gripper": {
+                    "positions": {"gap_m": left["gap_m"]},
+                    "velocities": {},
+                    "width_m": left["gap_m"],
+                    "requested_width_m": left["requested_opening"] * MAX_GAP_M,
+                    "touch_normal_force_N": left["touch_normal_force_N"],
+                },
+                **{
+                    f"{side}_arm": {
+                        "positions": dict(zip(ARM_JOINTS[side], robot["hands"][side]["arm_joint_angles"], strict=True)),
+                        "velocities": {},
+                        "tool": _tool_pose(robot["hands"][side]),
+                        "controller_status": robot["hands"][side]["controller_status"],
+                    }
+                    for side in SIDES
+                },
+                "right_hand": {
+                    "positions": dict(right["finger_joint_angles"]),
+                    "velocities": {},
+                    "requested_opening": right["requested_opening"],
+                    "touch_normal_force_N": right["touch_normal_force_N"],
+                },
+                "task": {
+                    "sim_time_s": self._sim_time,
+                    "finished": self._finished,
+                    "hands": {side: _tool_pose(hand) for side, hand in robot["hands"].items()},
+                    **self._task,
+                },
+            }
+            samples = {
+                key: Sample(
+                    source=f"task:{self.name}:{key}",
+                    provenance="simulation_ground_truth",
+                    clock_id="task_sim",
+                    clock_epoch=self._epoch,
+                    capture_time_ns=str(round(self._sim_time * 1e9)),
+                    valid=valid,
+                    values=values,
+                )
+                for key, values in groups.items()
+            }
+            feedback = Feedback(
+                execution_time_s=self._sim_time,
+                samples=samples,
+                activities=dict(self._activities),
+                stopped={rid: valid and settled and rid not in self._owner for rid, settled in self._settled.items()},
+                holding={
+                    "base": dict(ZERO_VELOCITY),
+                    "left_gripper": {"gap_m": left["requested_opening"] * MAX_GAP_M},
+                    **{f"{side}_arm": _flat_pose(self._hand_target[side]) for side in SIDES},
+                    "right_hand": {"opening": right["requested_opening"]},
+                },
+            )
+            for activity_id, status in list(self._activities.items()):
+                if status.phase == "done":  # reported once; its resource then holds what it reached
+                    del self._activities[activity_id]
+                    self._owner = {rid: owner for rid, owner in self._owner.items() if owner != activity_id}
+            return feedback
+
+    def close(self) -> None:
+        self._commands.put(None)
+        self._worker.join(timeout=30.0)
+        if self._process is not None:  # an attached simulator belongs to whoever started it
+            self._process.terminate()
+            try:
+                self._process.wait(timeout=10.0)
+            except subprocess.TimeoutExpired:
+                self._process.kill()
+        self._http.close()
+
+    # -- the worker: every simulator action runs here, in order ------------
+
+    def _work(self) -> None:
+        while (command := self._commands.get()) is not None:
+            try:
+                command()
+            except Exception:
+                # Feedback stays invalid until the simulator answers again, so nothing is confirmed meanwhile.
+                log.exception("task simulator command failed")
+                with self._lock:
+                    self._reachable = False
+
+    def _act(self, request: dict[str, Any]) -> dict[str, Any]:
+        response = self._http.post("/act", json=request)
+        if response.status_code == 400:
+            raise _Refused(response.json().get("error", "rejected"))
+        response.raise_for_status()
+        reply = response.json()
+        with self._lock:
+            self._record(reply)
+        return reply
+
+    def _record(self, reply: dict[str, Any]) -> None:
+        self._reachable = True
+        self._robot = reply["robot"]
+        self._sim_time = float(reply["sim_time"])
+        self._finished = bool(reply.get("finished", self._finished))
+        self._task.update({key: reply[key] for key in ("budget", "observations_remaining") if key in reply})
+
+    def _skip(self, activity_id: str) -> bool:
+        """True once a stop has overtaken this activity; the stop queued behind it applies the fallback."""
+        with self._lock:
+            cancelled = activity_id in self._cancelled
+            self._cancelled.discard(activity_id)
+            return cancelled
+
+    def _report(self, activity_id: str, status: ActivityStatus) -> None:
+        with self._lock:
+            if activity_id in self._activities:  # a stopped activity is no longer reported
+                self._activities[activity_id] = status
+
+    def _travel(self, activity_id: str, action: BaseVelocityGoal, limits: BaseVelocityLimits) -> None:
+        """Timed travel as equal `step` actions, then steps at rest. The judge decides from the measured poses."""
+        with self._lock:
+            judge = VelocityJudge(action, limits, self._sim_time, tuple(self._robot["base_xy_yaw"]), action.duration_s)
+        count = max(1, math.ceil(action.duration_s / STEP_MAX_S))
+        seconds = max(STEP_MIN_S, action.duration_s / count)
+        command = [action.forward_m_s, action.left_m_s, action.yaw_rate_rad_s]
+        try:
+            for _ in range(count):
+                if self._skip(activity_id):
+                    return
+                reply = self._act({"action": "step", "seconds": seconds, "base_velocity": command})
+                if reply["robot"]["fallen"]:
+                    self._report(activity_id, ActivityStatus("failed", error="robot_fell", detail="the robot fell"))
+                    return
+                status = judge.update(reply["sim_time"], tuple(reply["robot"]["base_xy_yaw"]), still_for_s=0.0)
+                if status.phase == "failed":
+                    self._report(activity_id, status)
+                    return
+            self._report(activity_id, ActivityStatus("finishing"))
+            rested, _ = self._rest(["base"])
+        except _Refused as refusal:
+            self._report(activity_id, ActivityStatus("failed", error="task_rejected", detail=str(refusal)))
+            return
+        with self._lock:
+            time_s, pose, stable = self._sim_time, tuple(self._robot["base_xy_yaw"]), self._robot["support"]["stable"]
+            self._settled["base"] = rested >= SETTLE_S
+        status = judge.update(time_s, pose, still_for_s=rested)  # where the base came to rest
+        if status.phase != "done":  # no stable stand was measured in the time this adapter steps for
+            detail = "the base did not come to a stable stand after travelling"
+            status = ActivityStatus("failed", judge.measurements(), error="base_not_settled", detail=detail)
+        status.measurements["stable"] = stable
+        self._report(activity_id, status)
+
+    def _grip(self, activity_id: str, action: GripperWidthGoal, limits: GripperWidthLimits) -> None:
+        """One `grip` action, then steps at rest. The judge decides from the gap measured after each step."""
+        if self._skip(activity_id):
+            return
+        judge = WidthJudge(action, limits)
+        try:
+            self._act({"action": "grip", "hand": "left", "opening": action.width_m / MAX_GAP_M})
+            self._report(activity_id, ActivityStatus("finishing"))
+            rested, status = self._rest(
+                ["left_gripper"], until=lambda robot: judge.update(robot["hands"]["left"]["gap_m"], SETTLE_STEP_S)
+            )
+        except _Refused as refusal:
+            self._report(activity_id, ActivityStatus("failed", error="task_rejected", detail=str(refusal)))
+            return
+        with self._lock:
+            hand = self._robot["hands"]["left"]
+            self._settled["left_gripper"] = rested >= SETTLE_S
+        if status.phase != "done":  # the gap never held at the width in the time this adapter steps for
+            measurements = {"width_m": hand["gap_m"], "error_m": abs(hand["gap_m"] - action.width_m)}
+            detail = "the jaws did not hold the requested width; something may be between them"
+            status = ActivityStatus("failed", measurements, error="width_not_reached", detail=detail)
+        status.measurements.update(touch_normal_force_N=hand["touch_normal_force_N"], at_rest=rested >= SETTLE_S)
+        self._report(activity_id, status)
+
+    def _pose(self, activity_id: str, action: ToolPoseGoal, limits: ToolPoseLimits) -> None:
+        """Steps that move the hand target along the judge's reference, then steps holding the goal pose, until
+        the judge decides from the tool site measured after each step."""
+        side, rid = action.target.removesuffix("_hand"), f"{action.target.removesuffix('_hand')}_arm"
+        with self._lock:
+            start = _tool_pose(self._robot["hands"][side])
+        if not all(
+            lo <= v <= hi
+            for v, lo, hi in zip(start["position_m"], limits.workspace_min_m, limits.workspace_max_m, strict=True)
+        ):
+            detail = "the hand starts outside the workspace, so a straight segment from it cannot be commanded"
+            self._report(
+                activity_id, ActivityStatus("failed", {"start": start}, error="start_outside_workspace", detail=detail)
+            )
+            return
+        judge = PoseJudge(action, limits, start["position_m"], start["orientation_xyzw"])
+        elapsed = 0.0
+        try:
+            while True:
+                if self._skip(activity_id):
+                    return
+                dt = POSE_STEP_S if elapsed < judge.duration_s else SETTLE_STEP_S
+                elapsed += dt
+                position, xyzw = judge.reference(elapsed)
+                with self._lock:
+                    self._hand_target[side] = {"frame_id": "world", "position_m": position, "orientation_xyzw": xyzw}
+                target = {"position": position, "quaternion": [xyzw[3], *xyzw[:3]]}
+                reply = self._act({"action": "step", "seconds": dt, "hands": {side: target}})
+                if reply["robot"]["fallen"]:
+                    self._report(activity_id, ActivityStatus("failed", error="robot_fell", detail="the robot fell"))
+                    return
+                measured = _tool_pose(reply["robot"]["hands"][side])
+                status = judge.update(elapsed, measured["position_m"], measured["orientation_xyzw"], dt)
+                if status.phase == "failed":
+                    self._report(activity_id, status)
+                    self._fallback([rid])  # the hand holds where it was measured, not the unreached target
+                    return
+                if status.phase == "done":
+                    break
+                if elapsed >= judge.duration_s:
+                    self._report(activity_id, ActivityStatus("finishing"))
+        except _Refused as refusal:
+            self._report(activity_id, ActivityStatus("failed", error="task_rejected", detail=str(refusal)))
+            return
+        with self._lock:
+            hand = self._robot["hands"][side]
+            self._settled[rid] = True  # the judge measured it within tolerance for settle_time_s
+        status.measurements.update(
+            touch_normal_force_N=hand["touch_normal_force_N"], controller_status=hand["controller_status"]
+        )
+        self._report(activity_id, status)
+
+    def _posture(self, activity_id: str, action: HandPostureGoal, limits: HandPostureLimits) -> None:
+        """One `grip` action to the posture's opening, then steps at rest. The judge decides from the finger
+        angles measured after each step."""
+        if self._skip(activity_id):
+            return
+        judge = PostureJudge(action, limits)
+        try:
+            self._act({"action": "grip", "hand": "right", "opening": POSTURE_OPENING[action.posture]})
+            self._report(activity_id, ActivityStatus("finishing"))
+            rested, status = self._rest(
+                ["right_hand"],
+                until=lambda robot: judge.update(
+                    {f"{name}": angle for name, angle in robot["hands"]["right"]["finger_joint_angles"].items()},
+                    SETTLE_STEP_S,
+                ),
+            )
+        except _Refused as refusal:
+            self._report(activity_id, ActivityStatus("failed", error="task_rejected", detail=str(refusal)))
+            return
+        with self._lock:
+            hand = self._robot["hands"]["right"]
+            self._settled["right_hand"] = rested >= SETTLE_S
+        if status.phase != "done":
+            targets = limits.postures[action.posture]
+            error = max(abs(hand["finger_joint_angles"][name] - angle) for name, angle in targets.items())
+            detail = "the fingers stopped short of the posture; something may be in the hand"
+            status = ActivityStatus("failed", {"max_error_rad": error}, error="posture_not_reached", detail=detail)
+        status.measurements.update(touch_normal_force_N=hand["touch_normal_force_N"], at_rest=rested >= SETTLE_S)
+        self._report(activity_id, status)
+
+    def _fallback(self, resources: Sequence[str]) -> None:
+        """What stop() queues: no travel, the gripper held where it is measured to be, and each arm held at its
+        hand's measured pose."""
+        try:
+            rested, _ = self._rest(resources, hold_measured=True)
+            settled = rested >= SETTLE_S
+        except _Refused as refusal:  # a fallen robot or a finished episode accepts no further motion
+            log.warning("the task simulator refused the fallback: %s", refusal)
+            settled = False
+        with self._lock:
+            for rid in resources:
+                self._settled[rid] = settled
+
+    def _rest(
+        self,
+        resources: Sequence[str],
+        *,
+        hold_measured: bool = False,
+        until: Callable[[dict[str, Any]], ActivityStatus] | None = None,
+    ) -> tuple[float, ActivityStatus]:
+        """Step with zero travel until measurements show these resources at rest and `until`, if given, decides
+        "done" from the robot state after a step; give up after SETTLE_LIMIT_S. Returns how long the resources
+        were last measured at rest, and `until`'s last decision.
+
+        hold_measured: first set the left gripper and the arms among `resources` to hold where they are measured.
+        The base is at rest when the task reports a stable stand; a gripper, hand or arm when it stops moving.
+        """
+        with self._lock:
+            before = self._robot
+        request: dict[str, Any] = {"action": "step", "seconds": SETTLE_STEP_S}
+        if hold_measured:
+            if "left_gripper" in resources:
+                request["openings"] = {"left": min(1.0, before["hands"]["left"]["gap_m"] / MAX_GAP_M)}
+            hands = {}
+            for side in SIDES:
+                if f"{side}_arm" in resources:
+                    pose = _tool_pose(before["hands"][side])
+                    with self._lock:
+                        self._hand_target[side] = pose
+                    hands[side] = {
+                        "position": pose["position_m"],
+                        "quaternion": [pose["orientation_xyzw"][3], *pose["orientation_xyzw"][:3]],
+                    }
+            if hands:
+                request["hands"] = hands
+        at_rest_for, waited, status = 0.0, 0.0, ActivityStatus("finishing")
+        while (at_rest_for < SETTLE_S or (until is not None and status.phase != "done")) and waited < SETTLE_LIMIT_S:
+            robot = self._act(request)["robot"]
+            waited += SETTLE_STEP_S
+            resting = _at_rest(resources, before, robot)
+            before = robot
+            at_rest_for = at_rest_for + SETTLE_STEP_S if resting else 0.0
+            if until is not None:
+                status = until(robot)
+        return at_rest_for, status
+
+
+def _at_rest(resources: Sequence[str], before: dict[str, Any], after: dict[str, Any]) -> bool:
+    """Whether each resource was still over one settle step, measured from the robot state before and after."""
+    hb, ha = before["hands"], after["hands"]
+    checks = {
+        "base": lambda: after["support"]["stable"],
+        "left_gripper": lambda: abs(ha["left"]["gap_m"] - hb["left"]["gap_m"]) < GAP_STILL_M,
+        "left_arm": lambda: math.dist(ha["left"]["position"], hb["left"]["position"]) < TOOL_STILL_M,
+        "right_arm": lambda: math.dist(ha["right"]["position"], hb["right"]["position"]) < TOOL_STILL_M,
+        "right_hand": lambda: (
+            max(
+                abs(angle - hb["right"]["finger_joint_angles"][name])
+                for name, angle in ha["right"]["finger_joint_angles"].items()
+            )
+            < FINGER_STILL_RAD
+        ),
+    }
+    return all(checks[rid]() for rid in resources)
+
+
+def _flat_pose(pose: dict[str, Any]) -> dict[str, float]:
+    """A pose as the flat numbers a retained target records."""
+    (x, y, z), (qx, qy, qz, qw) = pose["position_m"], pose["orientation_xyzw"]
+    return {"x_m": x, "y_m": y, "z_m": z, "qx": qx, "qy": qy, "qz": qz, "qw": qw}
+
+
+def _tool_pose(hand: dict[str, Any]) -> dict[str, Any]:
+    """A hand's tool site as the task measures it, with the quaternion reordered from the task's w, x, y, z."""
+    w, x, y, z = hand["quaternion_wxyz"]
+    return {"frame_id": "world", "position_m": hand["position"], "orientation_xyzw": [x, y, z, w]}
+
+
+def _camera_image(metadata: dict[str, Any], clock_epoch: str) -> CameraImage:
+    """The rgb image a task capture describes, in CameraImage's conventions.
+
+    The task states its lens as one focal length in pixels, centred, and its camera's rotation in MuJoCo's camera
+    axes (y up, looking along -z); optical axes flip y and z.
+    """
+    width, height, focal = metadata["width"], metadata["height"], float(metadata["focal_px"])
+    optical = [[row[0], -row[1], -row[2]] for row in metadata["world_from_camera"]]
+    return CameraImage(
+        kind="rgb",
+        media_type="image/png",
+        width=width,
+        height=height,
+        clock_id="task_sim",
+        clock_epoch=clock_epoch,
+        capture_time_ns=str(round(metadata["sim_time"] * 1e9)),
+        focal_px=[focal, focal],
+        principal_px=[width / 2, height / 2],
+        camera_pose=Pose(
+            frame_id="world",
+            position_m=[float(v) for v in metadata["camera_position"]],
+            orientation_xyzw=_quaternion_xyzw(optical),
+        ),
+    )
+
+
+def _quaternion_xyzw(m: list[list[float]]) -> list[float]:
+    """The unit quaternion of a rotation matrix, x, y, z, w; from its largest component, for precision."""
+    trace = m[0][0] + m[1][1] + m[2][2]
+    if trace > 0:
+        s = 2 * math.sqrt(1 + trace)
+        x, y, z, w = (m[2][1] - m[1][2]) / s, (m[0][2] - m[2][0]) / s, (m[1][0] - m[0][1]) / s, s / 4
+    elif m[0][0] > m[1][1] and m[0][0] > m[2][2]:
+        s = 2 * math.sqrt(1 + m[0][0] - m[1][1] - m[2][2])
+        x, y, z, w = s / 4, (m[0][1] + m[1][0]) / s, (m[0][2] + m[2][0]) / s, (m[2][1] - m[1][2]) / s
+    elif m[1][1] > m[2][2]:
+        s = 2 * math.sqrt(1 + m[1][1] - m[0][0] - m[2][2])
+        x, y, z, w = (m[0][1] + m[1][0]) / s, s / 4, (m[1][2] + m[2][1]) / s, (m[0][2] - m[2][0]) / s
+    else:
+        s = 2 * math.sqrt(1 + m[2][2] - m[0][0] - m[1][1])
+        x, y, z, w = (m[0][2] + m[2][0]) / s, (m[1][2] + m[2][1]) / s, s / 4, (m[1][0] - m[0][1]) / s
+    return [x, y, z, w]
