@@ -300,7 +300,7 @@ class TaskBackend(Backend):
             try:
                 if self._http.get("/health", timeout=2.0).json().get("ready"):
                     return
-            except (httpx.TransportError, ValueError):
+            except httpx.TransportError, ValueError:
                 pass
             time.sleep(0.2)
 

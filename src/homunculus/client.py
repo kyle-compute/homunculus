@@ -17,7 +17,7 @@ import uuid
 from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, TypeVar
+from typing import Any
 
 import httpx
 from pydantic import BaseModel, ValidationError
@@ -50,9 +50,6 @@ from .models import (
     Validation,
     VideoLink,
 )
-
-M = TypeVar("M", bound=BaseModel)
-T = TypeVar("T")
 
 IMAGE_SUFFIX = {"image/png": ".png", "image/jpeg": ".jpg", "application/x-npy": ".npy"}
 # The service answers a stop from workers it keeps for that, whatever else it is serving. A stop that is
@@ -262,7 +259,7 @@ class TargetStore:
             raise _refusal(response)
         try:
             robot_ids = [str(robot["robot_id"]) for robot in response.json()["robots"]]
-        except (ValueError, KeyError, TypeError):
+        except ValueError, KeyError, TypeError:
             raise _another_program(response) from None
         added = []
         for robot_id in robot_ids:
@@ -298,7 +295,7 @@ class TargetStore:
             url = json.loads(record.read_text())["url"]
             access = json.loads(tokens.read_text())
             client, operator = access["client"], access["operator"]
-        except (ValueError, KeyError, TypeError):
+        except ValueError, KeyError, TypeError:
             raise ClientError(
                 f"the service record or the tokens in {home} cannot be read",
                 hint="restart the service that runs there (`homunculus serve --home ...`); it says what is wrong",
@@ -689,7 +686,7 @@ class RobotClient:
             )
         return {"Authorization": f"Bearer {token}"}
 
-    def _call(
+    def _call[M: BaseModel](
         self,
         method: str,
         path: str,
@@ -781,7 +778,7 @@ def _request_id() -> str:
     return f"req-{uuid.uuid4().hex}"
 
 
-def _stated(given: T | None, otherwise: Callable[[], T]) -> T:
+def _stated[T](given: T | None, otherwise: Callable[[], T]) -> T:
     """What the caller stated, as stated; what this client knows only when the caller left it out.
 
     An empty request ID is not left out. Used in place of a new one, it would let a repeated command
@@ -803,7 +800,7 @@ def _refusal(response: httpx.Response) -> RobotError | ClientError:
     try:
         info = response.json()["error"]
         code, message, details = info["code"], info["message"], info.get("details", {})
-    except (ValueError, KeyError, TypeError):
+    except ValueError, KeyError, TypeError:
         return _another_program(response)  # the service gives every refusal that shape, whatever the path
     if code not in ERROR_STATUS:
         code, message = "internal_error", f"{code}: {message}"

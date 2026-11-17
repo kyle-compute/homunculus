@@ -37,7 +37,6 @@ from __future__ import annotations
 import hashlib
 import itertools
 import math
-import os
 import secrets
 import tempfile
 import threading
@@ -150,11 +149,11 @@ def _compile(folder: Path, rig: rigs.Rig) -> tuple[mujoco.MjModel, dict[str, str
         # on every machine and changes when any file the model includes does. The compiled model would not do:
         # it records the path of this temporary folder. A file the model names by an absolute path is not in it.
         digest = hashlib.sha256()
-        for directory, subdirectories, names in os.walk(side_by_side, followlinks=True):
+        for directory, subdirectories, names in side_by_side.walk(follow_symlinks=True):
             subdirectories[:] = sorted(name for name in subdirectories if not name.startswith("."))
             for name in sorted(name for name in names if not name.startswith(".")):
-                content = Path(directory, name).read_bytes()
-                beside = Path(directory, name).relative_to(side_by_side).as_posix()
+                content = (directory / name).read_bytes()
+                beside = (directory / name).relative_to(side_by_side).as_posix()
                 digest.update(f"{beside}\0{len(content)}\0".encode() + content)
         revisions = {"model_sha256": digest.hexdigest()[:12], **source}
         try:

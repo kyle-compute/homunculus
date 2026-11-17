@@ -828,10 +828,9 @@ stopped while it was starting.
 ## Limitations
 
 - A prototype for validating the interface. No physical robot, vendor SDK, or
-  native controller is connected. The tests run on macOS arm64 with Python 3.11,
-  3.13, 3.14 and 3.15.0rc2, and on Linux x86_64 (Debian, in a container) with
-  Python 3.11 and 3.15.2. It needs a POSIX system, for file locks and signals; Windows is not
-  supported.
+  native controller is connected. It needs Python 3.15, and was run on macOS arm64 and on
+  Linux x86_64 (Debian 13, in the image the Dockerfile builds), each with Python 3.15.2. It
+  needs a POSIX system, for file locks and signals; Windows is not supported.
 - The fake robots prove protocol behavior only. `fake:g1` does not simulate
   balance or gait and says so in its description.
 - Plain HTTP on loopback with static bearer tokens. Do not expose it to a

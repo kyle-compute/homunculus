@@ -69,23 +69,45 @@ the first time its rig is used, each under its own license. Objects: [Google Sca
 
 ## Install
 
-Needs Python 3.11 or newer and [uv](https://docs.astral.sh/uv/). No ROS, GPU, robot SDK or
+Needs [uv](https://docs.astral.sh/uv/). homunculus runs on Python 3.15, and `--python 3.15` has uv
+download it, so the Python already on the machine does not matter. No ROS, GPU, robot SDK or
 credentials.
 
 ```sh
 # from GitHub, with the MuJoCo backend:
-uv tool install "homunculus[mujoco] @ git+https://github.com/kyle-compute/homunculus"
+uv tool install --python 3.15 "homunculus[mujoco] @ git+https://github.com/kyle-compute/homunculus"
 
 # or from a checkout:
 uv build --wheel
-uv tool install dist/homunculus-0.1.0-py3-none-any.whl
+uv tool install --python 3.15 dist/homunculus-0.1.0-py3-none-any.whl
 
 # with the MuJoCo backend:
-uv tool install "dist/homunculus-0.1.0-py3-none-any.whl[mujoco]"
+uv tool install --python 3.15 "dist/homunculus-0.1.0-py3-none-any.whl[mujoco]"
 ```
 
-`pip install dist/homunculus-0.1.0-py3-none-any.whl` works as well. The wheel is 5.2 MB and
-installs 9.5 MB, nearly all of it the scanned objects in the three rigs. No robot model is in it.
+`pip install dist/homunculus-0.1.0-py3-none-any.whl` works as well, from Python 3.15. The wheel
+is 5.2 MB and installs 9.5 MB, nearly all of it the scanned objects in the three rigs. No robot
+model is in it.
+
+### In a container
+
+The [Dockerfile](Dockerfile) starts from an image with no Python and puts homunculus, with its own
+Python 3.15, under `/opt/homunculus`:
+
+```sh
+docker build -t homunculus .
+docker run --rm -it homunculus     # a shell with the `homunculus` command
+```
+
+An image of your own gets homunculus by copying that folder, whatever Python the image has:
+
+```dockerfile
+COPY --from=homunculus /opt/homunculus /opt/homunculus
+ENV PATH=/opt/homunculus/bin:$PATH MUJOCO_GL=egl
+```
+
+Code on an older Python drives a robot through the `homunculus` command or over HTTP. Only
+`import homunculus` needs Python 3.15.
 
 ## Quick start
 

@@ -528,7 +528,7 @@ def _load_tokens(home: Path) -> dict[str, str]:
             usable = isinstance(client, str) and isinstance(operator, str) and client and operator
             if not usable or client == operator:
                 raise ValueError
-        except (ValueError, KeyError, TypeError):
+        except ValueError, KeyError, TypeError:
             raise StartupError(
                 f"cannot use {path}: it does not hold a client token and a different operator token; "
                 "remove it to have new tokens written (clients then connect again)"
@@ -572,7 +572,7 @@ def serve(
         try:
             running = json.loads(record.read_text())
             owner = f"the service at {running['url']} (pid {running['pid']})"
-        except (OSError, ValueError, KeyError):  # no record: its owner is still starting, or is not a service
+        except OSError, ValueError, KeyError:  # no record: its owner is still starting, or is not a service
             owner = "another process"
         raise HomeInUse(f"service home {home} is in use by {owner}") from None
     # Each of these is released when its block ends, the last one built first, however the block ends: an error

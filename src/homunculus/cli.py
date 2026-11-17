@@ -942,7 +942,7 @@ def _service_record(home: Path) -> dict[str, Any]:
     """What the service running in `home` wrote about itself; empty when there is none."""
     try:
         return json.loads((home / "service.json").read_text())
-    except (OSError, ValueError):  # absent, or read while it is being written
+    except OSError, ValueError:  # absent, or read while it is being written
         return {}
 
 
@@ -951,7 +951,7 @@ def _demo_service(home: Path) -> dict[str, Any] | None:
     record = _service_record(home)
     try:
         health = httpx.get(f"{record['url']}/healthz", timeout=2.0, trust_env=False).json()  # no proxy
-    except (KeyError, ValueError, httpx.TransportError):
+    except KeyError, ValueError, httpx.TransportError:
         return None
     return record if health.get("boot_id") == record.get("boot_id") else None
 
