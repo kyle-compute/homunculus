@@ -465,6 +465,16 @@ class RobotClient:
         self._record(session_id=None, stream_id=None, session_operator=False)
         return session
 
+    @contextmanager
+    def session(self, lifetime_wall_s: float | None = None, takeover: bool = False) -> Iterator[Session]:
+        """Hold the control session for a block: acquired on the way in, released on the way out, however the
+        block ends, so an error in the block does not leave the robot held."""
+        session = self.open_session(lifetime_wall_s, takeover)
+        try:
+            yield session
+        finally:
+            self.close_session()
+
     # -- finite goals -----------------------------------------------------
 
     def validate(self, goal: GoalSpec | None = None, stream: StreamSpec | None = None) -> Validation:

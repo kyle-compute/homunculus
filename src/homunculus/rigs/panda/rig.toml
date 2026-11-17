@@ -1,0 +1,15 @@
+description = "Franka Emika Panda at a table, with a wrist camera and a workspace camera"
+menagerie = "franka_emika_panda"
+model = "table.xml"
+arm = ["joint1", "joint2", "joint3", "joint4", "joint5", "joint6", "joint7"]
+gripper = ["finger_joint1", "finger_joint2"]
+cameras = ["wrist", "workspace"]
+
+# The Panda ships without a wrist camera. This one sits 6 cm beside the hand, looking along the fingers and
+# tilted 25 degrees toward them.
+[[mount]]
+camera = "wrist"
+body = "hand"
+pos = [0.06, 0.0, 0.02]
+quat = [0.15305, 0.69035, 0.69035, 0.15305]
+fovy = 58.0

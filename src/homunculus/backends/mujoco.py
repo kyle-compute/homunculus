@@ -6,10 +6,10 @@ profile's judge (profiles.py) decides success from the measured joint state, so
 a result here is evidence about simulated physics. It is not evidence about any
 physical robot.
 
-By default it loads the Franka Emika Panda from MuJoCo Menagerie, copied
-unchanged into assets/franka_emika_panda, standing at a table with a scanned mug
-and bowl (homunculus_scene.xml there). Another model works (`--backend-arg
-model=FILE`) when:
+It serves a rig (rigs/__init__.py): a folder whose rig.toml names an MJCF model,
+the joints to drive, and the robot's cameras. By default that is `panda`, the
+Franka Emika Panda from MuJoCo Menagerie at a table with a scanned mug and bowl.
+A rig's model works when:
 
 - each arm joint is a limited hinge or slide joint, and each gripper joint a
   limited slide joint;
@@ -21,19 +21,25 @@ model=FILE`) when:
 
 The gripper's width is the sum of its finger joints' positions.
 
-The robot's cameras are the model cameras that `cameras` names; observations
-record them. Every other named camera is a spectator camera, for people watching
-its live video. The Panda scene's robot cameras are `wrist`, on the hand, and
-`workspace`, across the table; its spectator camera is `overview`. Cameras are
-set by their vertical field of view. Frames are rendered by MuJoCo's OpenGL
-renderer and sent as JPEG, with the lens and the camera's pose at capture.
+The robot's cameras are the model cameras that the rig's `cameras` names;
+observations record them. Every other named camera is a spectator camera, for
+people watching its live video. The Panda rig's own cameras are `wrist`, on the
+hand, and `workspace`, across the table; its spectator camera is `overview`.
+Cameras are set by their vertical field of view. Frames are rendered by MuJoCo's
+OpenGL renderer and sent as JPEG, with the lens and the camera's pose at capture.
+
+check() is how a rig is accepted: it drives one through the runtime, as a client
+would, and reports what was measured.
 """
 
 from __future__ import annotations
 
 import hashlib
+import itertools
 import math
+import os
 import secrets
+import tempfile
 import threading
 from collections.abc import Sequence
 from concurrent.futures import ThreadPoolExecutor
@@ -43,14 +49,21 @@ from pathlib import Path
 from typing import Any
 
 import mujoco
+import mujoco_menagerie
 import numpy as np
 from PIL import Image
 
+from .. import rigs
+from ..journal import Journal
 from ..models import (
+    TERMINAL_GOAL_STATES,
     BackendInfo,
     CameraImage,
     ClockInfo,
     Contract,
+    Goal,
+    GoalSubmit,
+    GripperWidthGoal,
     GripperWidthLimits,
     JointLimit,
     JointTrajectoryGoal,
@@ -60,41 +73,104 @@ from ..models import (
     RobotError,
     Sample,
     SensorInfo,
+    SessionOpen,
+    TrajectoryPoint,
 )
 from ..profiles import ActivityStatus, TrajectoryJudge, WidthJudge, sample_trajectory
-from ..runtime import Backend, BackendFacts, Clock, Feedback, Frame, ResourceSpec, StartupError, SystemClock
+from ..runtime import (
+    Backend,
+    BackendFacts,
+    Clock,
+    Feedback,
+    Frame,
+    Principal,
+    ResourceSpec,
+    Runtime,
+    StartupError,
+    SystemClock,
+)
 
 PERIOD_S = 0.01
 # Physics never runs more than this far behind the host clock; beyond it, time is dropped and counted as lag.
 MAX_CATCH_UP_S = 0.1
 VIDEO_FPS = 20.0
 JPEG_QUALITY = 90
-PANDA = (Path(__file__).parent.parent / "assets" / "franka_emika_panda" / "homunculus_scene.xml").resolve()
-ARM_JOINTS = tuple(f"joint{n}" for n in range(1, 8))
-FINGER_JOINTS = ("finger_joint1", "finger_joint2")
-PANDA_CAMERAS = ("wrist", "workspace")
+# The files of a Menagerie robot that are about it, not part of its model. They stay out of the folder a rig is
+# compiled in, so a rig may have a README and a LICENSE of its own.
+MENAGERIE_DOCUMENTS = ("README.md", "LICENSE", "CHANGELOG.md")
 # MuJoCo's cameras look along their -z with y up; optical axes look along +z with y down.
 OPTICAL = np.diag([1.0, -1.0, -1.0])
 
 
-def robots(
-    model: str = str(PANDA),
-    arm: str = ",".join(ARM_JOINTS),
-    gripper: str = ",".join(FINGER_JOINTS),
-    cameras: str = ",".join(PANDA_CAMERAS),
-    robot_id: str = "sim-arm",
-) -> dict[str, Backend]:
+def robots(rig: str = "panda", robot_id: str | None = None) -> dict[str, Backend]:
     """The robot `--backend mujoco` serves.
 
-    Options: `model`, an MJCF file (default: the Panda at a table); `arm` and `gripper`, comma-separated joint
-    names (an empty gripper means none); `cameras`, the model cameras that are the robot's own (the others are
-    for spectators); `robot_id`.
+    Options: `rig`, the name of a rig that ships with homunculus or the path of a rig folder (default: the Panda
+    at a table); `robot_id` (default: the rig folder's name).
     """
-    arm_joints = [name for name in arm.split(",") if name]
-    finger_joints = [name for name in gripper.split(",") if name]
-    robot_cameras = [name for name in cameras.split(",") if name]
-    path = Path(model).expanduser().resolve()
-    return {robot_id: MujocoBackend(SystemClock(), path, arm_joints, finger_joints, robot_cameras)}
+    folder = rigs.find(rig)
+    return {robot_id or folder.name: MujocoBackend(SystemClock(), folder)}
+
+
+def _compile(folder: Path, rig: rigs.Rig) -> tuple[mujoco.MjModel, dict[str, str]]:
+    """The rig's model, compiled, and the revisions that say what it was compiled from.
+
+    A model can only `<include>` a robot that sits in its own folder: MuJoCo looks for an included file's meshes
+    from the including file. So the rig's files and its Menagerie robot's files are set side by side, as links,
+    in a folder that lasts for the compile. Nothing is written into the rig or into Menagerie's download.
+
+    A name that starts with a dot is not part of a rig: `.git`, or the `.DS_Store` that macOS leaves in a folder.
+    """
+    with tempfile.TemporaryDirectory(prefix="homunculus-rig-") as temporary:
+        side_by_side = Path(temporary)
+        for entry in folder.iterdir():
+            if not entry.name.startswith("."):
+                (side_by_side / entry.name).symlink_to(entry)
+        source = {}
+        if rig.menagerie is not None:
+            try:
+                robot = mujoco_menagerie.get(rig.menagerie)
+                files = robot.path()  # downloaded and checked on first use, then read from Menagerie's cache
+            except mujoco_menagerie.MenagerieError as error:
+                raise StartupError(
+                    f"cannot get the robot {rig.menagerie!r} from MuJoCo Menagerie: {error}\n"
+                    "`homunculus install` downloads a rig's robot while this machine is online"
+                ) from None
+            source = {"menagerie": f"{robot.name}@{robot.oid[:12]}"}
+            for entry in files.iterdir():
+                if entry.name in MENAGERIE_DOCUMENTS or entry.name.startswith("."):
+                    continue
+                if (side_by_side / entry.name).exists():
+                    raise StartupError(
+                        f"{entry.name} is in the rig folder {folder} and in Menagerie's {rig.menagerie}, "
+                        "which load side by side; rename the rig's"
+                    )
+                (side_by_side / entry.name).symlink_to(entry)
+        # `model_sha256` is over every file beside the model, by its name there and its bytes, so it is the same
+        # on every machine and changes when any file the model includes does. The compiled model would not do:
+        # it records the path of this temporary folder. A file the model names by an absolute path is not in it.
+        digest = hashlib.sha256()
+        for directory, subdirectories, names in os.walk(side_by_side, followlinks=True):
+            subdirectories[:] = sorted(name for name in subdirectories if not name.startswith("."))
+            for name in sorted(name for name in names if not name.startswith(".")):
+                content = Path(directory, name).read_bytes()
+                beside = Path(directory, name).relative_to(side_by_side).as_posix()
+                digest.update(f"{beside}\0{len(content)}\0".encode() + content)
+        revisions = {"model_sha256": digest.hexdigest()[:12], **source}
+        try:
+            spec = mujoco.MjSpec.from_file(str(side_by_side / rig.model))
+            for mount in rig.mount:
+                # MJCF cannot add a child to a body that an included file defines, so a rig states such a camera.
+                body = spec.body(mount.body)
+                if body is None:
+                    raise StartupError(
+                        f"rig.toml mounts the camera {mount.camera!r} on the body {mount.body!r}, "
+                        f"which the model {rig.model} does not have"
+                    )
+                body.add_camera(name=mount.camera, pos=mount.pos, quat=mount.quat, fovy=mount.fovy)
+            return spec.compile(), revisions
+        except ValueError as error:
+            raise StartupError(f"cannot load the model {rig.model} of the rig {folder}: {error}") from None
 
 
 @dataclass
@@ -126,33 +202,17 @@ class _Group:
 
 
 class MujocoBackend(Backend):
-    def __init__(
-        self, clock: Clock, model_path: Path, arm: Sequence[str], gripper: Sequence[str], cameras: Sequence[str]
-    ):
-        """An empty gripper means the model has none. `cameras` are the model cameras that are the robot's own."""
-        try:
-            spec = mujoco.MjSpec.from_file(str(model_path))
-            if model_path == PANDA:
-                # MJCF cannot add a child to a body that an included file defines, so the Panda scene's wrist
-                # camera is added here: 6 cm beside the hand, looking along the fingers, tilted 25 degrees toward
-                # them.
-                spec.body("hand").add_camera(
-                    name="wrist", pos=[0.06, 0, 0.02], quat=[0.15305, 0.69035, 0.69035, 0.15305], fovy=58
-                )
-            self._model = spec.compile()
-        except ValueError as error:
-            raise StartupError(f"cannot load the MuJoCo model {model_path}: {error}") from None
+    def __init__(self, clock: Clock, folder: Path):
+        """`folder` is a rig: rig.toml and the model it names."""
+        rig = rigs.load(folder)
+        arm, gripper, cameras = rig.arm, rig.gripper, rig.cameras
+        self._model, revisions = _compile(folder, rig)
         name = self._model.names.split(b"\0", 1)[0].decode()  # <mujoco model="...">
-        # Hashed as compiled, so that a change to any included file or mesh changes the revision.
-        compiled = np.zeros(mujoco.mj_sizeModel(self._model), np.uint8)
-        mujoco.mj_saveModel(self._model, None, compiled)
-        self._revisions = {"robot_description": name, "model_sha256": hashlib.sha256(compiled).hexdigest()[:12]}
+        self._revisions = {"robot_description": name, **revisions}
         self._notice = (
-            f"MuJoCo simulation of the model {name!r} in {model_path.name}. "
+            f"MuJoCo simulation of the model {name!r}, from the rig {folder.name!r}. "
             "Results are simulated physics, not a physical robot."
         )
-        if not arm:
-            raise StartupError("the mujoco backend needs at least one arm joint (--backend-arg arm=NAME,...)")
         self._data = mujoco.MjData(self._model)
         self._clock = clock
         self._last: float | None = None  # host time of the previous advance; the world starts at the first
@@ -171,8 +231,8 @@ class MujocoBackend(Backend):
         for camera in cameras:
             if camera not in named:
                 raise StartupError(
-                    f"the MuJoCo model has no camera named {camera!r}; it has {named}. Name the robot's own cameras "
-                    "with --backend-arg cameras=NAME,... (empty for none)"
+                    f"the rig's model has no camera named {camera!r}; it has {named}. rig.toml's `cameras` names "
+                    "the robot's own, and each `[[mount]]` adds one"
                 )
         for camera in named:
             if model.cam_sensorsize[model.camera(camera).id].any():
@@ -560,3 +620,155 @@ def _is_position_servo(model: mujoco.MjModel, actuator: int) -> bool:
         and model.actuator_gainprm[actuator, 0] > 0
         and model.actuator_biasprm[actuator, 1] < 0
     )
+
+
+# --------------------------------------------------------------------------
+# Checking a rig
+# --------------------------------------------------------------------------
+
+HOLD_S = 2.0  # how long the start pose must hold
+MOVE_S = 1.5  # how long each checking move takes
+MOVE = 0.15  # how far each checking move goes, in the joint's unit: at most a fifth of the joint's range
+GOAL_WAIT_S = 90.0  # longer than any goal's own deadline
+
+
+@dataclass(frozen=True)
+class Step:
+    """One thing check() tried, and what was measured."""
+
+    name: str
+    passed: bool
+    detail: str
+
+
+class _SteppedClock:
+    """Time that moves only when the check moves it, so a check takes as long as its physics takes to compute."""
+
+    def __init__(self) -> None:
+        self.t = 0.0
+
+    def now(self) -> float:
+        return self.t
+
+
+def check(folder: Path, images: Path) -> list[Step]:
+    """Drive a rig as a client would, through the runtime and its judges, and say what was measured.
+
+    A rig that cannot be loaded raises StartupError, as it does when a service starts it. One that loads is
+    asked to hold its start pose, to move each arm joint to a goal and back, to close and open its gripper, and
+    to take a picture with each of its cameras, saved into `images`.
+
+    Passing shows that the rig is wired correctly: its joints, actuators, start pose, and cameras are what
+    rig.toml says. It does not show that the arm is strong enough for a task: an SO-101 with one actuator at a
+    hundredth of its stiffness still passes. It does not show that a camera is aimed well either: a camera
+    inside a mesh still renders a picture. Look at the pictures.
+    """
+    clock = _SteppedClock()
+    steps: list[Step] = []
+    with (
+        MujocoBackend(clock, folder) as backend,
+        tempfile.TemporaryDirectory(prefix="homunculus-check-") as temporary,
+        Journal(Path(temporary) / "journal.sqlite", "boot-check") as journal,
+    ):
+        runtime = Runtime(folder.name, backend, journal, boot_id="boot-check", clock=clock)
+        client = Principal("check")
+        context = runtime.describe().context_id
+        limits = {binding.profile: binding.limits for binding in runtime.describe().profiles}
+        arm = limits["joints.trajectory/1"]
+        requests = itertools.count()
+
+        def run(seconds: float) -> None:
+            for _ in range(round(seconds / PERIOD_S)):
+                clock.t += PERIOD_S
+                runtime.tick()
+
+        def positions() -> dict[str, float]:
+            return runtime.observe().samples["arm"].values["positions"]
+
+        def finish(action: JointTrajectoryGoal | GripperWidthGoal) -> Goal:
+            """Submit a goal and run until it ends by its own rules: success, a tolerance, or its deadline."""
+            request = GoalSubmit(
+                request_id=f"check-{next(requests)}", session_id=session, context_id=context, action=action
+            )
+            goal_id = runtime.submit_goal(client, request).goal_id
+            waited = 0.0
+            while runtime.goal(goal_id).state not in TERMINAL_GOAL_STATES and waited < GOAL_WAIT_S:
+                run(0.25)
+                waited += 0.25
+            run(0.25)  # the resources settle before the next goal asks for them
+            return runtime.goal(goal_id)
+
+        def move(joint: str, position: float) -> Goal:
+            point = TrajectoryPoint(time_s=MOVE_S, positions=[position], velocities=[0.0])
+            return finish(
+                JointTrajectoryGoal(profile="joints.trajectory/1", target="arm", joints=[joint], points=[point])
+            )
+
+        def outcome(goal: Goal) -> str:
+            return goal.state if goal.result is None else f"{goal.state} ({goal.result.reason})"
+
+        units = {limit.name: limit.unit for limit in arm.joints}
+        home = positions()
+        run(HOLD_S)
+        held = positions()
+        worst = max(home, key=lambda joint: abs(held[joint] - home[joint]))
+        drift = abs(held[worst] - home[worst])
+        steps.append(
+            Step(
+                "holds its start pose",
+                drift <= arm.goal_tolerance,
+                f"{worst} moved {drift:.4f} {units[worst]} in {HOLD_S:g} s; {arm.goal_tolerance:g} is allowed",
+            )
+        )
+        if not steps[-1].passed:
+            return steps  # nothing after this would start from where it says it starts
+
+        session = runtime.open_session(
+            client, SessionOpen(request_id=f"check-{next(requests)}", context_id=context)
+        ).session_id
+        failed = []
+        for limit in arm.joints:
+            start = positions()[limit.name]
+            step = min(MOVE, 0.2 * (limit.max_position - limit.min_position))
+            toward_middle = 1 if start < (limit.min_position + limit.max_position) / 2 else -1
+            out = move(limit.name, start + toward_middle * step)
+            back = move(limit.name, home[limit.name])
+            if out.state != "succeeded" or back.state != "succeeded":
+                failed.append(f"{limit.name}: out {outcome(out)}, back {outcome(back)}")
+        steps.append(
+            Step(
+                "each arm joint reaches a goal and returns",
+                not failed,
+                "; ".join(failed) or f"{len(arm.joints)} joints, each moved up to {MOVE:g} rad or m and back",
+            )
+        )
+
+        if "gripper.width/1" in limits:
+            gripper = limits["gripper.width/1"]
+            widths = [(gripper.min_width_m + gripper.max_width_m) / 2, gripper.max_width_m]
+            goals = [
+                finish(GripperWidthGoal(profile="gripper.width/1", target="gripper", width_m=width)) for width in widths
+            ]
+            steps.append(
+                Step(
+                    "the gripper closes halfway and opens",
+                    all(goal.state == "succeeded" for goal in goals),
+                    ", ".join(f"{width:.3f} m {outcome(goal)}" for width, goal in zip(widths, goals, strict=True)),
+                )
+            )
+
+        for sensor in runtime.describe().sensors:
+            if sensor.kind != "camera":
+                continue
+            try:
+                image = runtime.observe([sensor.id]).images[0]
+            except RobotError as error:
+                steps.append(Step(f"camera {sensor.id} takes a picture", False, error.message))
+                continue
+            images.mkdir(parents=True, exist_ok=True)
+            path = images / f"{folder.name}-{sensor.id}.jpg"
+            path.write_bytes(runtime.image(image.handle)[1])
+            steps.append(
+                Step(f"camera {sensor.id} takes a picture", True, f"{image.width}x{image.height}, saved as {path}")
+            )
+        return steps

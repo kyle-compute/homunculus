@@ -36,12 +36,12 @@ way they would be on real hardware:
   <tr>
     <td><b>Franka Panda</b>, <code>wrist</code>: over the mug before a grasp</td>
     <td><b>SO-101</b>, <code>wrist_cam</code>: a figure and a plate</td>
-    <td><b>UR5e</b>, seen by a fixed <b>Intel RealSense D435i</b>: the tool over the plate</td>
+    <td><b>UR5e</b>, <code>realsense</code>, a fixed camera with the colour field of view of an Intel RealSense D435i: the tool over the plate</td>
   </tr>
 </table>
 
-The same commands drove all three; only the backend arguments changed. Is the reported camera
-information right? For 15 objects across these cameras, each object's true centre was projected using
+The same commands drove all three; only the rig changed: `homunculus demo start panda`, `so101` or
+`ur5e`. Is the reported camera information right? For 15 objects across these cameras, each object's true centre was projected using
 only the lens and pose the CLI reported, and checked against a segmentation render: **15 of 15 landed
 on their object.**
 
@@ -49,10 +49,9 @@ on their object.**
   <img src="docs/images/panda-workspace-check.jpg" width="60%" alt="Panda workspace camera with crosshairs marking the projected centres of a bowl and a mug, each on its object">
 </p>
 
-The Panda scene ships with homunculus (`--backend mujoco`). The SO-101 and UR5e scenes (desk, bench,
-camera pole, objects) were written for these images and are not in this repository yet. Robots and
-camera: [MuJoCo Menagerie](https://github.com/google-deepmind/mujoco_menagerie/tree/370c43965323c0944b433b202aac5058b5f907a9),
-each under its own license. Objects: [Google Scanned Objects](https://github.com/kevinzakka/mujoco_scanned_objects/tree/6ff8d275cebfd5b47e49685e3cfbe64b20e49a3c)
+All three ship with homunculus as [rigs](#rigs): the scene, the objects, and where the cameras sit. Each
+robot's own files are downloaded from [MuJoCo Menagerie](https://github.com/google-deepmind/mujoco_menagerie/tree/370c43965323c0944b433b202aac5058b5f907a9)
+the first time its rig is used, each under its own license. Objects: [Google Scanned Objects](https://github.com/kevinzakka/mujoco_scanned_objects/tree/6ff8d275cebfd5b47e49685e3cfbe64b20e49a3c)
 (CC BY 4.0, Downie et al., ICRA 2022). The green figure is the scan in that collection's
 `Great_Dinos_Triceratops_Toy` folder, which is actually an Android figure.
 
@@ -61,17 +60,16 @@ each under its own license. Objects: [Google Scanned Objects](https://github.com
 | Backend | Robots | What a result shows |
 | --- | --- | --- |
 | `fake` | `fake:arm` (the joints and gripper of the Franka Emika Panda) and `fake:g1` (walking base and hand), no physics | That the protocol behaves correctly |
-| `mujoco` | `sim:arm`, the Franka Emika Panda arm and gripper from [MuJoCo Menagerie](https://github.com/google-deepmind/mujoco_menagerie) at a table with a scanned mug and bowl. Its cameras: `wrist` and `workspace`, plus `overview` for people watching | Simulated physics |
+| `mujoco` | One [rig](#rigs): `panda` (Franka Emika Panda at a table), `so101` (SO-101 at a desk), `ur5e` (UR5e at a bench), or a rig folder of your own. The robots are from [MuJoCo Menagerie](https://github.com/google-deepmind/mujoco_menagerie) | Simulated physics |
 | `task` | One downloaded G1 benchmark task, run by its own simulator and graded by its own verifier | Simulated physics of that task |
 | `MODULE:FUNCTION` | Your own robot or simulator: a `Backend` subclass, such as [`examples/lift.py`](examples/lift.py) | What your backend measures |
 
-The MuJoCo backend also loads a model of your own: `--backend-arg model=arm.xml`, with the
-joints to drive named in `arm=` and `gripper=`, and the robot's cameras in `cameras=`. [Your own robot](docs/guide.md#your-own-robot)
-in the guide covers both.
+[Your own robot](docs/guide.md#your-own-robot) in the guide covers a backend of your own, and
+[Rigs](docs/guide.md#rigs) covers a MuJoCo model of your own.
 
 ## Install
 
-Needs Python 3.10 or newer and [uv](https://docs.astral.sh/uv/). No ROS, GPU, robot SDK or
+Needs Python 3.11 or newer and [uv](https://docs.astral.sh/uv/). No ROS, GPU, robot SDK or
 credentials.
 
 ```sh
@@ -86,8 +84,8 @@ uv tool install dist/homunculus-0.1.0-py3-none-any.whl
 uv tool install "dist/homunculus-0.1.0-py3-none-any.whl[mujoco]"
 ```
 
-`pip install dist/homunculus-0.1.0-py3-none-any.whl` works as well. The wheel is 6.4 MB and
-installs 37 MB, nearly all of it the Panda's meshes and the two scanned objects.
+`pip install dist/homunculus-0.1.0-py3-none-any.whl` works as well. The wheel is 5.2 MB and
+installs 9.5 MB, nearly all of it the scanned objects in the three rigs. No robot model is in it.
 
 ## Quick start
 
@@ -115,13 +113,49 @@ homunculus stream close                             # or let it expire: the base
 Run those lines together. If you type them one at a time, the 1 s target expires and the base
 stops before your update arrives.
 
+## Rigs
+
+A rig is a robot body for the MuJoCo backend: a folder with a `rig.toml` and the MJCF scene it names.
+`rig.toml` names the robot in MuJoCo Menagerie that the scene includes, the joints that are the arm
+and the gripper, and the cameras that are the robot's own. A rig is data. Nothing in it runs.
+
+```console
+$ homunculus rigs
+RIG    ROBOT
+panda  franka_emika_panda     Franka Emika Panda at a table, with a wrist camera and a workspace camera
+so101  robotstudio_so101      SO-101 arm at a desk, with its wrist camera
+ur5e   universal_robots_ur5e  UR5e arm at a bench, watched by a fixed camera
+  ...
+$ homunculus install so101
+so101: SO-101 arm at a desk, with its wrist camera
+  ok  holds its start pose                       elbow_flex moved 0.0004 rad in 2 s; 0.02 is allowed
+  ok  each arm joint reaches a goal and returns  6 joints, each moved up to 0.15 rad or m and back
+  ok  camera wrist_cam takes a picture           640x480, saved as /Users/you/.homunculus/images/so101-wrist_cam.jpg
+ready: start it with `homunculus demo start so101`
+$ homunculus demo start so101
+```
+
+`install` downloads the rig's robot (3.9 MB for the SO-101), then drives the rig through the same
+runtime a client uses and reports what it measured. It took 5.9 s the first time and 0.5 s after
+that. Once a robot is downloaded, starting its rig needs no network. `homunculus demo start so101`
+without `install` downloads the robot too.
+
+homunculus has no download code of its own. DeepMind's
+[`mujoco-menagerie`](https://pypi.org/project/mujoco-menagerie/) package fetches each robot, checks
+its sha256, and keeps it in its cache; homunculus pins that package to one version, so a rig's name
+means the same files on every machine. `homunculus --json describe` reports them under `revisions`.
+
+A rig of your own is a folder, named by its path: `homunculus install ./my-arm`.
+[Rigs](docs/guide.md#rigs) in the guide has the file format, what the check does and does not show,
+and which of Menagerie's 28 arms the backend drives as they are (17).
+
 ## What the agent sees
 
 `homunculus observe --camera NAME` records the robot's own cameras, saves each image, and prints its
 path with the lens and where the camera was. An agent opens the file to see it.
 
 ```console
-$ homunculus -t sim:arm observe --camera wrist --camera workspace
+$ homunculus -t panda observe --camera wrist --camera workspace
   ...
   image wrist rgb 640x480 image/jpeg: /Users/you/.homunculus/images/wrist-rgb-img-ccf5a695-1.jpg
     lens [433, 433] px focal, centre [320, 240] px; camera at [0.4555, 0.1189, 0.2945] m,
@@ -134,7 +168,7 @@ $ homunculus -t sim:arm observe --camera wrist --camera workspace
 Every backend states its images the same way, whatever produced them: undistorted, with focal
 lengths and principal point in pixels, and the camera's pose at capture with optical axes. With
 those, a pixel and its depth give a point in metres. A camera that is only for people watching
-(`overview` on `sim:arm`) plays with `homunculus video` but is never in an observation.
+(`overview` on `panda`) plays with `homunculus video` but is never in an observation.
 
 A robot refuses what it does not support before anything is sent:
 
@@ -147,9 +181,10 @@ error: fake-g1 does not offer joints.trajectory/1 as a goal; it offers: base.pla
 
 | Command | Does |
 | --- | --- |
-| `homunculus demo start / stop / status` | Run a local demo service in the background |
+| `homunculus demo start [RIG] / stop / status` | Run a local demo service in the background: fake robots, or a rig |
+| `homunculus rigs`, `install RIG` | List the rigs that ship; download a rig's robot and check that the rig works |
 | `homunculus targets`, `use`, `connect`, `forget` | Manage the robots the CLI knows about |
-| `homunculus serve` | Run a service in the foreground |
+| `homunculus serve [RIG]` | Run a service in the foreground |
 | `homunculus describe` | Show profiles, limits, units, frames and current state |
 | `homunculus observe [--camera NAME] [--save DIR]` | Read measurements; with `--camera`, save the robot's camera images and print their paths |
 | `homunculus video CAMERA` | Print a link that plays a camera live in a browser, the robot's or a spectator's |
@@ -188,16 +223,15 @@ from homunculus.client import RobotClient, TargetStore
 from homunculus.models import GripperWidthGoal
 
 store = TargetStore()  # the targets `homunculus demo start` or `homunculus connect` saved
-with RobotClient(store.get("fake:arm"), on_change=store.save) as robot:
-    robot.open_session()
+with RobotClient(store.get("fake:arm"), on_change=store.save) as robot, robot.session():
     robot.submit_goal(GripperWidthGoal(profile="gripper.width/1", target="gripper", width_m=0.03))
     goal = robot.wait_goal()
     print(goal.state, goal.result.measurements, goal.retained)
-    robot.close_session()
 ```
 
-A robot has one control session. If the CLI already holds it, `open_session()` is refused with
-`session_conflict`. Leave that call out to work in the CLI's session.
+`robot.session()` takes the control session for the block and releases it when the block ends, after
+an error too. A robot has one control session. If the CLI already holds it, `robot.session()` is
+refused with `session_conflict`. Leave it out to work in the CLI's session.
 
 ## Limitations
 
@@ -208,6 +242,10 @@ A robot has one control session. If the CLI already holds it, `open_session()` i
 - A live video link lets anyone who has it watch, without a token, until it expires. Live video
   is a stream of whole JPEG images, 0.87 MB/s for one viewer of a Panda camera, and was watched
   in Chromium only.
+- A rig's robot is downloaded from GitHub the first time, so a rig's first start needs the network.
+- The MuJoCo backend does not compensate gravity, needs a keyframe named `home`, and refuses a
+  camera set by sensor size. For those reasons 11 of Menagerie's 28 arms do not pass
+  `homunculus install` as they are.
 - Implemented profiles: `joints.trajectory/1`, `gripper.width/1`, `hand.posture/1`,
   `base.planar_velocity/1`. Tool-pose movement and contact-based gripper completion are refused
   as unsupported.
@@ -222,26 +260,29 @@ A robot has one control session. If the CLI already holds it, `open_session()` i
 
 ## Third-party files
 
-`src/homunculus/assets/franka_emika_panda/` holds the Franka Emika Panda model from
-[MuJoCo Menagerie](https://github.com/google-deepmind/mujoco_menagerie/tree/370c43965323c0944b433b202aac5058b5f907a9/franka_emika_panda),
-commit `370c439`, copied unchanged under its Apache-2.0 license (`LICENSE` in that folder). Only
-`homunculus_scene.xml` there is this project's: the table, the objects, and the cameras.
+No robot model is in this repository. Each rig in `src/homunculus/rigs/` names its robot in
+[MuJoCo Menagerie](https://github.com/google-deepmind/mujoco_menagerie/tree/370c43965323c0944b433b202aac5058b5f907a9),
+and the `mujoco-menagerie` package, pinned to version 2026.11.3, downloads that robot's files as
+they are at commit `370c439`: the Panda and the SO-101 under Apache-2.0, the UR5e under
+BSD-3-Clause. The scene file in each rig (`table.xml`, `desk.xml`, `bench.xml`) is this project's.
 
-`src/homunculus/assets/google_scanned_objects/` holds a mug and a bowl from
+The `objects/` folder in each rig holds the objects of its scene, from
 [Google Scanned Objects](https://app.gazebosim.org/GoogleResearch/fuel/collections/Scanned%20Objects%20by%20Google%20Research)
 (meshes and textures, CC BY 4.0, by Google), as converted for MuJoCo by
 [kevinzakka/mujoco_scanned_objects](https://github.com/kevinzakka/mujoco_scanned_objects) (MIT),
-commit `6ff8d27`, copied unchanged. See the `README.md` there.
+commit `6ff8d27`, copied unchanged. See the `README.md` in each.
 
 ## Development
 
 ```sh
-uv sync --extra mujoco
-uv run pytest                                    # contract tests: fake robots, examples/lift.py, MuJoCo
+uv sync --extra mujoco                           # on Python 3.15, which .python-version names
+uv run pytest                                    # fake robots, examples/lift.py, MuJoCo, rigs
 uv run ruff check && uv run ruff format --check
 ```
 
 Code is in `src/homunculus/`: `cli.py` (commands and output), `client.py` (HTTP client and
 saved targets), `server.py` (HTTP service and backend loading), `runtime.py` (sessions, goals,
 streams, stops, and the `Backend` base class), `profiles.py` (what each motion profile means,
-and the judges that decide success), `models.py` (shared types) and `backends/`.
+and the judges that decide success), `models.py` (shared types), `backends/`, and `rigs/` (the
+rigs that ship, and the reader of `rig.toml`). The MuJoCo tests download three robots from
+Menagerie, 9.3 MB, the first time they run.

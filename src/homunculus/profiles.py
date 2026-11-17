@@ -15,6 +15,7 @@ by the same rules, with the same measurements.
 
 from __future__ import annotations
 
+import bisect
 import itertools
 import math
 from collections.abc import Iterable, Mapping, Sequence
@@ -355,13 +356,10 @@ def check_path(points: Sequence[TrajectoryPoint], joints: Sequence[JointLimit], 
         for joint, q, v in zip(joints, point.positions, point.velocities, strict=True):
             _within(f"{joint.name} position", q, joint.min_position - slack, joint.max_position + slack, point=index)
             _within(f"{joint.name} velocity", v, -joint.max_velocity, joint.max_velocity, point=index)
-    for index in range(len(points) - 1):
-        a, b = points[index], points[index + 1]
+    for index, (a, b) in enumerate(itertools.pairwise(points)):
         duration = b.time_s - a.time_s
-        for column, joint in enumerate(joints):
-            low, high, speed, acceleration = _segment_extrema(
-                a.positions[column], a.velocities[column], b.positions[column], b.velocities[column], duration
-            )
+        for joint, p0, v0, p1, v1 in zip(joints, a.positions, a.velocities, b.positions, b.velocities, strict=True):
+            low, high, speed, acceleration = _segment_extrema(p0, v0, p1, v1, duration)
             where = {"segment": index}
             _within(f"{joint.name} position", low, joint.min_position - slack, math.inf, **where)
             _within(f"{joint.name} position", high, -math.inf, joint.max_position + slack, **where)
@@ -375,8 +373,8 @@ def sample_trajectory(points: Sequence[TrajectoryPoint], time_s: float) -> tuple
         return list(points[0].positions), list(points[0].velocities)
     if time_s >= points[-1].time_s:
         return list(points[-1].positions), [0.0] * len(points[-1].positions)
-    index = next(i for i in range(len(points) - 1) if time_s < points[i + 1].time_s)
-    a, b = points[index], points[index + 1]
+    later = bisect.bisect_right(points, time_s, key=lambda point: point.time_s)  # the first waypoint after time_s
+    a, b = points[later - 1], points[later]
     duration = b.time_s - a.time_s
     s = (time_s - a.time_s) / duration
     positions, velocities = [], []

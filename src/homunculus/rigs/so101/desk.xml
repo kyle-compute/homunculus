@@ -1,0 +1,57 @@
+<mujoco model="SO-101 at a desk">
+  <!--
+    The SO-101 clamped to a desk, with a toy and a plate in reach. This is the scene of the rig `so101`.
+
+    so101.xml and its meshes are MuJoCo Menagerie's robotstudio_so101 (Apache-2.0), unchanged. They are not in
+    this folder: rig.toml names the robot, and its files are downloaded and loaded beside this one. The lighting
+    and floor are those of Menagerie's own scene.xml.
+
+    The toy and the plate are Google Scanned Objects; see objects/README.md.
+
+    Cameras. The robot's own is `wrist_cam`, which Menagerie's model carries on its wrist. `overview` is for
+    people only. Menagerie's model has no start pose, so the keyframe `home` at the end of this file gives one:
+    the arm folded over its base.
+  -->
+  <include file="so101.xml"/>
+
+  <visual>
+    <headlight diffuse="0.6 0.6 0.6" ambient="0.3 0.3 0.3" specular="0 0 0"/>
+    <rgba haze="0.15 0.25 0.35 1"/>
+    <global azimuth="160" elevation="-20" offwidth="640" offheight="480"/>
+  </visual>
+
+  <asset>
+    <texture type="skybox" builtin="gradient" rgb1="0.3 0.5 0.7" rgb2="0 0 0" width="512" height="3072"/>
+    <texture type="2d" name="groundplane" builtin="checker" mark="edge" rgb1="0.2 0.3 0.4" rgb2="0.1 0.2 0.3"
+      markrgb="0.8 0.8 0.8" width="300" height="300"/>
+    <material name="groundplane" texture="groundplane" texuniform="true" texrepeat="5 5" reflectance="0.2"/>
+    <material name="desk" rgba="0.55 0.53 0.5 1" specular="0" shininess="0"/>
+    <model name="figure" file="objects/Great_Dinos_Triceratops_Toy/model.xml"/>
+    <model name="plate" file="objects/Ecoforms_Plant_Plate_S11Turquoise/model.xml"/>
+  </asset>
+
+  <worldbody>
+    <light pos="0 0 3.5" dir="0 0 -1" directional="true"/>
+    <geom name="floor" size="0 0 0.05" pos="0 0 -0.75" type="plane" material="groundplane"/>
+    <body name="desk" pos="0 0 0">
+      <geom name="desktop" type="box" size="0.5 0.6 0.02" pos="0 0 -0.02" material="desk"/>
+      <geom type="box" size="0.025 0.025 0.355" pos="-0.45 -0.55 -0.395" material="desk"/>
+      <geom type="box" size="0.025 0.025 0.355" pos="-0.45 0.55 -0.395" material="desk"/>
+      <geom type="box" size="0.025 0.025 0.355" pos="0.45 -0.55 -0.395" material="desk"/>
+      <geom type="box" size="0.025 0.025 0.355" pos="0.45 0.55 -0.395" material="desk"/>
+    </body>
+    <body name="figure" pos="0.25 0.07 0.002" euler="0 0 1.2">
+      <freejoint name="figure"/>
+      <attach model="figure" body="model" prefix="figure_"/>
+    </body>
+    <body name="plate" pos="0.25 -0.09 0.002">
+      <freejoint name="plate"/>
+      <attach model="plate" body="model" prefix="plate_"/>
+    </body>
+    <camera name="overview" pos="0.6 -0.6 0.45" xyaxes="0.707 0.707 0 -0.35 0.35 0.87"/>
+  </worldbody>
+
+  <keyframe>
+    <key name="home" qpos="0 -1.309 0.845 1.244 -1.58 0" ctrl="0 -1.309 0.845 1.244 -1.58 0"/>
+  </keyframe>
+</mujoco>

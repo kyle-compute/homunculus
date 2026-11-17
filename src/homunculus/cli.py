@@ -11,7 +11,9 @@ input, 3 the service refused the request, 4 no target or service to talk to,
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import io
+import itertools
 import json
 import math
 import os
@@ -22,14 +24,14 @@ import sys
 import textwrap
 import time
 from collections.abc import Iterator, Mapping
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from pathlib import Path
 from typing import Any, NoReturn
 
 import httpx
 from pydantic import BaseModel, TypeAdapter, ValidationError
 
-from . import __version__, journal
+from . import __version__, journal, rigs
 from .client import STOP_WITHOUT_SESSION, ClientError, RequestInterrupted, RobotClient, TargetStore, WaitTimeout
 from .models import (
     PROTOCOL,
@@ -145,7 +147,7 @@ def _width() -> int:
 
 def _columns(rows: list[tuple[str, ...]], indent: int = 2) -> str:
     """Rows as aligned columns. The last column wraps under itself instead of running past the terminal."""
-    widths = [max(len(row[i]) for row in rows) for i in range(len(rows[0]))]
+    widths = [max(map(len, column)) for column in zip(*rows, strict=True)]
     lead = indent + sum(widths[:-1]) + 2 * (len(widths) - 1)
     room = max(30, _width() - lead)
     lines = []
@@ -393,12 +395,8 @@ def _robot(args: argparse.Namespace) -> Iterator[RobotClient]:
     """A client for the selected target. What it learns (session, last goal) is saved as soon as it learns it,
     so another command can act on a goal while this one still waits for it."""
     store = TargetStore()
-    client = RobotClient(store.get(args.target), on_change=store.save)
-    try:
+    with RobotClient(store.get(args.target), on_change=store.save) as client:
         yield client
-    finally:
-        client.close()
-        store.save()
 
 
 def _source(path: str) -> str:
@@ -796,6 +794,49 @@ def connect(args: argparse.Namespace) -> int:
     return OK
 
 
+def list_rigs(args: argparse.Namespace) -> int:
+    shipped = {name: rigs.load(rigs.SHIPPED / name) for name in rigs.names()}
+    rows = [(name, rig.menagerie or "in the rig's folder", rig.description) for name, rig in shipped.items()]
+    text = (
+        _columns([("RIG", "ROBOT", ""), *rows], indent=0)
+        + "\n\nA robot named in the ROBOT column is downloaded from MuJoCo Menagerie on first use.\n"
+        "check one and download its robot:  homunculus install RIG\n"
+        "start one:                         homunculus demo start RIG\n"
+        "a rig folder of your own is named by its path, such as ./my-arm"
+    )
+    _emit(args, {"rigs": [{"name": name, **rig.model_dump()} for name, rig in shipped.items()]}, text)
+    return OK
+
+
+def install(args: argparse.Namespace) -> int:
+    folder = rigs.find(args.rig)
+    rig = rigs.load(folder)
+    try:
+        from .backends.mujoco import check  # MuJoCo loads only for the commands that need it
+    except ImportError as error:
+        raise StartupError(f"cannot check a rig: {error}\n{rigs.NEEDS_MUJOCO}") from None
+    images = Path(os.path.abspath(Path(args.save).expanduser())) if args.save else TargetStore().home / "images"
+    steps = check(folder, images)
+    passed = all(step.passed for step in steps)
+    text = (
+        f"{folder.name}: {rig.description}\n"
+        + _columns([("ok" if step.passed else "FAILED", step.name, step.detail) for step in steps])
+        + (
+            f"\nready: start it with `homunculus demo start {args.rig}`"
+            if passed
+            else "\nnot ready: a service that serves this rig has the fault that the failed step shows"
+        )
+    )
+    document = {
+        "rig": folder.name,
+        "folder": str(folder),
+        "passed": passed,
+        "steps": [dataclasses.asdict(step) for step in steps],
+    }
+    _emit(args, document, text)
+    return OK if passed else FAILED
+
+
 def targets(args: argparse.Namespace) -> int:
     store = TargetStore()
     document = {
@@ -840,13 +881,32 @@ def _no_default(store: TargetStore) -> str:
     return ""
 
 
+def _backend(args: argparse.Namespace) -> tuple[str, dict[str, str]]:
+    """The backend that a `serve` or `demo start` command line names, and its options.
+
+    RIG is short for the mujoco backend serving that rig. Without RIG or --backend, the backend is fake.
+    """
+    options = dict(args.backend_arg)
+    if len(options) < len(args.backend_arg):
+        raise UsageError("give each --backend-arg KEY once")
+    if args.rig is None:
+        return args.backend or "fake", options
+    if args.backend not in (None, "mujoco") or "rig" in options:
+        raise UsageError(
+            f"{args.rig!r} names the rig for the mujoco backend to serve; "
+            "give it without another --backend and without --backend-arg rig="
+        )
+    return "mujoco", {**options, "rig": args.rig}
+
+
 def _serve_options(args: argparse.Namespace) -> list[str]:
     """The options `homunculus demo start` gives the `homunculus serve` it starts.
 
-    That service runs in this directory.
+    That service runs in this directory, so the path of a rig folder means the same to it.
     """
-    options = ["--backend", args.backend, "--port", str(args.port)]
-    for key, value in args.backend_arg:
+    backend, backend_options = _backend(args)
+    options = ["--backend", backend, "--port", str(args.port)]
+    for key, value in backend_options.items():
         options += ["--backend-arg", f"{key}={value}"]
     return options
 
@@ -855,12 +915,10 @@ def serve(args: argparse.Namespace) -> int:
     from .server import HomeInUse  # the service stack loads only for this command
     from .server import serve as run_service
 
-    options = dict(args.backend_arg)
-    if len(options) < len(args.backend_arg):
-        raise UsageError("give each --backend-arg KEY once")
+    backend, options = _backend(args)
     try:
         run_service(
-            args.backend,
+            backend,
             options,
             Path(os.path.abspath(Path(args.home).expanduser())) if args.home else TargetStore().home / "service",
             host=args.host,
@@ -930,14 +988,12 @@ def _end(process: subprocess.Popen[bytes]) -> None:
 def _terminate(pid: int, patience_s: float = 15.0) -> None:
     """Ask a service another command started to shut down, and wait until it is gone; kill it only if it stays."""
     deadline = time.monotonic() + patience_s
-    try:
+    with suppress(ProcessLookupError):  # raised by the first signal sent after the process is gone
         os.kill(pid, signal.SIGTERM)
         while time.monotonic() < deadline:
-            os.kill(pid, 0)  # raises once the process no longer exists
+            os.kill(pid, 0)
             time.sleep(0.05)
         os.kill(pid, signal.SIGKILL)
-    except ProcessLookupError:
-        pass
 
 
 def demo_start(args: argparse.Namespace) -> int:
@@ -995,7 +1051,7 @@ def demo_start(args: argparse.Namespace) -> int:
         raise
     names = ", ".join(t.name for t in added)
     text = (
-        f"demo service started ({args.backend} backend) at {record['url']}, pid {record['pid']}\n"
+        f"demo service started ({record['backend']} backend) at {record['url']}, pid {record['pid']}\n"
         f"targets: {names}   (default: {store.default}; choose another with --target or `homunculus use`)\n"
         f"files: {home}\n\n"
         "try:\n"
@@ -1163,10 +1219,17 @@ def _parser() -> argparse.ArgumentParser:
 
     def backend_options(leaf: argparse.ArgumentParser) -> None:
         leaf.add_argument(
+            "rig",
+            nargs="?",
+            metavar="RIG",
+            help="a robot body for the mujoco backend to serve: a name from `homunculus rigs`, such as so101, "
+            "or the path of a rig folder, such as ./my-arm",
+        )
+        leaf.add_argument(
             "--backend",
-            default="fake",
             metavar="NAME",
-            help="fake, mujoco, task, or MODULE:FUNCTION for a backend of your own (default: fake)",
+            help="fake, mujoco, task, or MODULE:FUNCTION for a backend of your own "
+            "(default: mujoco with a RIG, otherwise fake)",
         )
         leaf.add_argument(
             "--backend-arg",
@@ -1174,7 +1237,7 @@ def _parser() -> argparse.ArgumentParser:
             action="append",
             default=[],
             metavar="KEY=VALUE",
-            help="an option for the backend, such as model=arm.xml for mujoco; repeat for more",
+            help="an option for the backend, such as robot_id=left for mujoco; repeat for more",
         )
         leaf.add_argument(
             "--port", type=_port, default=0, metavar="N", help="port to listen on (default: any free port)"
@@ -1221,6 +1284,23 @@ def _parser() -> argparse.ArgumentParser:
         default="warning",
         choices=("debug", "info", "warning", "error"),
         help="how much the service logs to standard error (default: warning)",
+    )
+
+    command(commands, "rigs", list_rigs, "List the robot bodies that ship with homunculus.")
+    leaf = command(commands, "install", install, "Download a rig's robot and check that the rig works here.")
+    leaf.epilog = (
+        "The check loads the rig, then asks it to hold its start pose, to move each arm joint to a goal and "
+        "back, to close and open its gripper, and to take a picture with each of its cameras. It shows that "
+        "the rig is wired correctly. It does not show that the arm is strong enough for a task or that a camera "
+        "is aimed well: look at the pictures. Once a rig's robot is downloaded, starting it needs no network."
+    )
+    leaf.add_argument(
+        "rig", metavar="RIG", help="a name from `homunculus rigs`, or the path of a rig folder, such as ./my-arm"
+    )
+    leaf.add_argument(
+        "--save",
+        metavar="DIR",
+        help="save the cameras' pictures into DIR (default: $HOMUNCULUS_HOME/images, ~/.homunculus/images if unset)",
     )
 
     leaf = command(commands, "connect", connect, "Add the robots of a running service as targets.")
@@ -1431,13 +1511,14 @@ def _parser() -> argparse.ArgumentParser:
     command(commands, "version", version, "Print the version.")
 
     sections = {
-        "Get started": ["demo", "targets", "use", "connect", "forget", "serve"],
+        "Get started": ["demo", "rigs", "install", "targets", "use", "connect", "forget", "serve"],
         "Read the robot": ["describe", "observe", "video", "events"],
         "Move it": ["session", "goal", "stream"],
         "Stop and recover": ["stop", "manage", "operation"],
         "Other": ["version"],
     }
-    assert sorted(sum(sections.values(), [])) == sorted(summaries), "every command is listed once"
+    listed = itertools.chain.from_iterable(sections.values())
+    assert sorted(listed) == sorted(summaries), "every command is listed once"
     width = max(map(len, summaries)) + 2
     listing = [
         f"{title}:\n" + "\n".join(f"  {name.ljust(width)}{summaries[name]}" for name in names)

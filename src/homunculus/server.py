@@ -6,6 +6,7 @@ serve() wires the concrete backend to a runtime and owns the control threads.
 """
 
 import asyncio
+import contextlib
 import hmac
 import importlib
 import inspect
@@ -19,10 +20,10 @@ import socket
 import sys
 import threading
 import time
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Callable, Iterator
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from typing import Annotated, Any
+from typing import Annotated, Any, Self
 
 import uvicorn
 from fastapi import APIRouter, Depends, FastAPI, Header, Query, Request
@@ -57,6 +58,7 @@ from .models import (
     Validation,
     VideoLink,
 )
+from .rigs import NEEDS_MUJOCO
 from .runtime import Backend, Frame, Principal, Runtime, StartupError
 
 log = logging.getLogger(__name__)
@@ -70,7 +72,10 @@ BUILT_IN = {
 
 
 class Service:
-    """The runtimes one process serves, their control and stopping threads, and who may call them."""
+    """The runtimes one process serves, their control and stopping threads, and who may call them.
+
+    The control threads run for the length of a `with` block. Leaving it stops them and then the robots.
+    """
 
     def __init__(self, runtimes: dict[str, Runtime], tokens: dict[str, Principal], boot_id: str, limits: ServiceLimits):
         self.runtimes = runtimes
@@ -93,11 +98,12 @@ class Service:
             rid: ThreadPoolExecutor(max_workers=2, thread_name_prefix=f"stop:{rid}") for rid in runtimes
         }
 
-    def start(self) -> None:
+    def __enter__(self) -> Self:
         for thread in self._threads:
             thread.start()
+        return self
 
-    def close(self) -> None:
+    def __exit__(self, *exc: object) -> None:
         self.closing.set()
         for thread in self._threads:
             if thread.is_alive():
@@ -488,9 +494,7 @@ def load_backends(backend: str, options: dict[str, str]) -> dict[str, Backend]:
         module = importlib.import_module(module_name)
     except ImportError as error:
         hint = (
-            "Install the wheel with its extra, for example:\n"
-            "  uv tool install 'dist/homunculus-0.1.0-py3-none-any.whl[mujoco]'\n"
-            "or add MuJoCo to the environment this command runs in:  pip install 'mujoco>=3.2'"
+            NEEDS_MUJOCO
             if backend == "mujoco"
             else "the module must be importable here: install it, or run from its directory with PYTHONPATH=."
         )
@@ -571,10 +575,9 @@ def serve(
         except (OSError, ValueError, KeyError):  # no record: its owner is still starting, or is not a service
             owner = "another process"
         raise HomeInUse(f"service home {home} is in use by {owner}") from None
-    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    backends: dict[str, Backend] = {}
-    service = None
-    try:
+    # Each of these is released when its block ends, the last one built first, however the block ends: an error
+    # while starting, an interrupt, or termination.
+    with journal, socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener, contextlib.ExitStack() as robots:
         record.unlink(missing_ok=True)  # left by a service that was killed; this one writes its own when ready
         # Bind before the tokens are written or a backend starts, so an unusable address fails early.
         listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -592,14 +595,11 @@ def serve(
             log.warning("listening on %s without TLS: tokens and commands cross the network in clear text", host)
         url = f"http://{host}:{listener.getsockname()[1]}"
         backends = load_backends(backend, backend_options)
+        for robot in backends.values():
+            robots.enter_context(robot)
         runtimes = {
             rid: Runtime(rid, robot, journal, boot_id=boot_id, limits=limits) for rid, robot in backends.items()
         }
-        service = Service(runtimes, principals, boot_id, limits)
-        server = uvicorn.Server(
-            uvicorn.Config(create_app(service), log_level=log_level, access_log=False, timeout_graceful_shutdown=3)
-        )
-        service.start()
         description = {
             "url": url,
             "pid": os.getpid(),
@@ -608,18 +608,23 @@ def serve(
             "robots": sorted(runtimes),
             "version": __version__,
         }
-        scratch = home / "service.json.tmp"  # renamed into place, so a reader never sees half a record
-        scratch.write_text(json.dumps(description, indent=2))
-        scratch.replace(record)
-        print(f"homunculus {__version__} serving {', '.join(sorted(runtimes))} at {url}", flush=True)
-        print(f"service home: {home}   (connect with: homunculus connect --home {home})", flush=True)
-        server.run(sockets=[listener])
+        with Service(runtimes, principals, boot_id, limits) as service:
+            server = uvicorn.Server(
+                uvicorn.Config(create_app(service), log_level=log_level, access_log=False, timeout_graceful_shutdown=3)
+            )
+            with _announced(record, description):
+                print(f"homunculus {__version__} serving {', '.join(sorted(runtimes))} at {url}", flush=True)
+                print(f"service home: {home}   (connect with: homunculus connect --home {home})", flush=True)
+                server.run(sockets=[listener])
+
+
+@contextlib.contextmanager
+def _announced(record: Path, description: dict[str, Any]) -> Iterator[None]:
+    """service.json, which tells local clients where the running service listens: there for the block."""
+    scratch = record.with_name(record.name + ".tmp")  # renamed into place, so a reader never sees half a record
+    scratch.write_text(json.dumps(description, indent=2))
+    scratch.replace(record)
+    try:
+        yield
     finally:
         record.unlink(missing_ok=True)
-        if service is not None:
-            service.close()
-        else:  # startup failed before the runtimes took ownership of their backends
-            for robot in backends.values():
-                robot.close()
-        journal.close()
-        listener.close()

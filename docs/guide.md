@@ -11,6 +11,7 @@ How each part of `homunculus` behaves, in more detail than the [README](../READM
 - [Units, frames, and clocks](#units-frames-and-clocks)
 - [Structured input](#structured-input)
 - [MuJoCo example](#mujoco-example)
+- [Rigs](#rigs)
 - [Camera images](#camera-images)
 - [A downloaded benchmark task](#a-downloaded-benchmark-task)
 - [Your own robot](#your-own-robot)
@@ -271,7 +272,7 @@ refused.
 ## MuJoCo example
 
 ```sh
-homunculus demo start --backend mujoco      # needs the [mujoco] extra
+homunculus demo start panda                 # needs the [mujoco] extra; downloads the Panda the first time
 homunculus session open
 homunculus goal joints joint2=0.6 joint4=-1.8 --duration 2 --wait
 homunculus goal gripper 0.02 --wait
@@ -280,9 +281,10 @@ homunculus observe --camera wrist --camera workspace   # and what the robot's ca
 homunculus demo stop
 ```
 
-`sim:arm` is the Franka Emika Panda from
-[MuJoCo Menagerie](https://github.com/google-deepmind/mujoco_menagerie), copied
-unchanged into `assets/franka_emika_panda/` (commit `370c439`, Apache-2.0): its
+`panda` is one of the [rigs](#rigs) that ship with homunculus. Its robot is the
+Franka Emika Panda from
+[MuJoCo Menagerie](https://github.com/google-deepmind/mujoco_menagerie),
+unchanged (commit `370c439`, Apache-2.0): its
 meshes, masses, joint ranges, and force-limited position actuators. It stands on
 a table, with a mug and a bowl from Google Scanned Objects in front of it; both
 are free to move. The arm
@@ -324,15 +326,57 @@ set up for manipulation would:
 scene from the front and to the side. It is for people: `homunculus video overview`
 plays it live (see [Live video](#live-video)), and an observation refuses it.
 
-The same backend drives a model of your own. Name the model, its arm joints,
-its gripper's finger joints (or none, with `gripper=`), and the cameras that
-are the robot's own (or none, with `cameras=`):
+## Rigs
+
+The MuJoCo backend serves a rig: a folder that holds a `rig.toml` and the MJCF
+model it names. A rig is data. Nothing in it runs. Three ship with homunculus,
+and `homunculus rigs` lists them:
+
+| Rig | Robot, from MuJoCo Menagerie | Scene | The robot's cameras |
+| --- | --- | --- | --- |
+| `panda` | `franka_emika_panda`: 7 arm joints and a two-finger gripper | a table with a mug and a bowl | `wrist`, `workspace` |
+| `so101` | `robotstudio_so101`: 5 arm joints and a jaw, driven as a sixth joint | a desk with a figure and a plate | `wrist_cam` |
+| `ur5e` | `universal_robots_ur5e`: 6 arm joints, no gripper | a bench with a mug, a plate and a toy bee | `realsense`, fixed on a pole |
+
+Each rig also has an `overview` camera, for people watching.
 
 ```sh
-homunculus demo start --backend mujoco --backend-arg model=my_arm.xml \
-    --backend-arg arm=joint1,joint2,joint3 --backend-arg gripper=finger_l,finger_r \
-    --backend-arg cameras=hand_camera
+homunculus install so101       # download its robot, then check that the rig works here
+homunculus demo start so101    # short for: --backend mujoco --backend-arg rig=so101
+homunculus serve ./my-arm      # a rig folder of your own, named by its path
 ```
+
+A bare word names a shipped rig, in any case. A path has a slash or starts with
+a dot. The robot is named after the rig's folder, so the `so101` rig's target is
+`so101`; `--backend-arg robot_id=NAME` gives it another name.
+
+### The rig file
+
+`rig.toml` says what MJCF does not. This is the Panda's:
+
+```toml
+description = "Franka Emika Panda at a table, with a wrist camera and a workspace camera"
+menagerie = "franka_emika_panda"   # optional: the Menagerie robot whose files load beside this folder's
+model = "table.xml"                # an MJCF file in this folder
+arm = ["joint1", "joint2", "joint3", "joint4", "joint5", "joint6", "joint7"]
+gripper = ["finger_joint1", "finger_joint2"]   # optional: finger joints that slide
+cameras = ["wrist", "workspace"]   # optional: the model cameras that are the robot's own
+
+[[mount]]                          # optional, repeatable: a camera fixed to one of the robot's bodies
+camera = "wrist"
+body = "hand"
+pos = [0.06, 0.0, 0.02]            # metres, in the body's frame
+quat = [0.15305, 0.69035, 0.69035, 0.15305]   # w x y z; the camera looks along its -z, with y up
+fovy = 58.0                        # vertical field of view, in degrees
+```
+
+A key that is not one of these is refused. With `menagerie`, the robot's files
+load as if they were in the rig's folder, so the model includes them by name:
+`<include file="panda.xml"/>`. A file in the rig's folder cannot have the name
+of one of the robot's files. Without `menagerie`, the folder holds every file
+the model needs. `[[mount]]` is there because MJCF cannot add a camera to a body
+that an included file defines. A name that starts with a dot, such as `.git`,
+is not part of a rig.
 
 The model must meet three conditions, and the service refuses to start with the
 reason when it does not:
@@ -346,23 +390,109 @@ reason when it does not:
   several joints, as the Panda's finger actuator does.
 - The model has a keyframe named `home`, where the world starts and resets.
 
-To load another robot from Menagerie, put your scene file in the robot's folder,
-next to its `scene.xml`, as `homunculus_scene.xml` is. MuJoCo 4.0.1 does not find
-the meshes of a file included from another folder, and the model does not load.
-A camera on one of the robot's bodies has to be written inside that body: MJCF
-cannot add to a body that an included file defines. That is why the backend
-adds the Panda's `wrist` camera in code when it loads `homunculus_scene.xml`.
+Each camera that `cameras` names is one of the robot's own; every other named
+camera is a spectator camera, for live video only. Cameras are rendered at the
+model's offscreen size (`<global offwidth=… offheight=…/>` under `<visual>`;
+640x480 unless the model sets it) and must be set by `fovy`; a camera with a
+`sensorsize` is refused. Rendering needs OpenGL. On a machine without a
+display, set MuJoCo's `MUJOCO_GL` environment variable to `egl` or `osmesa`.
+On Linux x86_64 with Mesa's software renderer, `egl` ran every rig and the
+tests, and `osmesa` ran the SO-101 and gave the same picture. A camera that
+cannot render is refused with that advice.
 
-`--backend-arg robot_id=NAME` names the robot (default `sim-arm`).
+### Where the robot comes from
 
-Each named `<camera>` in `cameras=` is one of the robot's cameras; every other
-named camera is a spectator camera, for live video only. Cameras are rendered
-at the model's offscreen size (`<global offwidth=… offheight=…/>` under
-`<visual>`; 640x480 unless the model sets it) and must be set by `fovy`; a
-camera with a `sensorsize` is refused. Rendering needs OpenGL. On a
-machine without a display, MuJoCo's `MUJOCO_GL` environment variable selects
-another, such as `egl`; that is untested here. A camera that cannot render is
-refused with that advice.
+homunculus has no download, checksum or cache code. The
+[`mujoco-menagerie`](https://pypi.org/project/mujoco-menagerie/) package does
+that work, and homunculus's `mujoco` extra pins it to one version, 2026.11.3.
+That version's robots are Menagerie at commit `370c439`. The package downloads
+one archive per robot, checks it against a sha256 it carries, and unpacks it
+into its own cache folder (`~/Library/Caches/mujoco_menagerie` on macOS;
+`MENAGERIE_CACHE_DIR` moves it).
+
+| Robot | Download | On disk | License |
+| --- | ---: | ---: | --- |
+| `franka_emika_panda` | 2.9 MB | 32.8 MB | Apache-2.0 |
+| `robotstudio_so101` | 3.9 MB | 16.6 MB | Apache-2.0 |
+| `universal_robots_ur5e` | 2.5 MB | 29.6 MB | BSD-3-Clause |
+
+A rig's robot is downloaded the first time the rig is installed or started.
+After that, the rig needs no network. With downloads blocked, an installed
+`so101` started and moved; `homunculus install ur5e`, whose robot was not
+downloaded, exited with status 1 and said why.
+
+`homunculus --json describe` reports what a rig was built from, under
+`revisions`:
+
+```json
+{
+  "robot_description": "SO-101 at a desk",
+  "model_sha256": "672371e73152",
+  "menagerie": "robotstudio_so101@8b739c94709a"
+}
+```
+
+`menagerie` is the robot and the start of its git tree id in Menagerie.
+`model_sha256` is over every file the model can include, the rig's and the
+robot's, by name and content. Neither depends on where the files are or on the
+machine, so two machines that serve the same rig report the same values.
+
+### What install checks
+
+`homunculus install RIG` loads the rig and drives it through the runtime, as a
+client would, on a clock that it steps itself:
+
+1. The rig holds its start pose. After 2 s, no arm joint has moved more than
+   the goal tolerance, 0.02 rad or m.
+2. Each arm joint in turn moves toward the middle of its range and back. It
+   moves 0.15 rad or m, or a fifth of its range if that is less. Both goals
+   must succeed, judged from measurement like any goal.
+3. The gripper, if the rig has one, closes halfway and opens.
+4. Each of the robot's cameras takes a picture, saved in
+   `$HOMUNCULUS_HOME/images` or in `--save DIR`.
+
+The command exits with status 0 when every step passes and 1 when one fails.
+`--json` gives each step. A rig that fails step 1 is not driven further.
+
+A pass shows that the rig is wired correctly: the names in `rig.toml` exist, the
+actuators hold and move their joints, and the cameras render. It does not show
+that the arm is strong enough for a task, or that a camera is aimed well. In a
+trial of these steps on the SO-101, an actuator weakened to 3% of its stiffness
+still passed, and so did a wrist camera moved inside the gripper. Look at the
+pictures.
+
+The tests plant these faults:
+
+| Fault | Where it is caught |
+| --- | --- |
+| A joint, a camera or a mount body that the model does not have | when the rig loads, with the reason |
+| A Menagerie robot that does not exist; a key that `rig.toml` does not define | when the rig loads, with the reason |
+| A joint that gravity pulls 0.059 rad from its start pose | step 1 |
+| A post in the way of a joint | step 2 |
+
+### Menagerie's arms
+
+[`examples/menagerie_sweep.py`](../examples/menagerie_sweep.py) measures which
+of Menagerie's 28 arms the backend drives as they are. For each arm it writes a
+rig by rule and runs the same check. The rule: Menagerie's own scene, and as arm
+joints every hinge or slide joint with a range that one actuator drives. With
+MuJoCo 4.0.1, 17 pass: `agilex_piper`, `fanuc_crx5ia`, `flexiv_rizon4`,
+`franka_emika_panda`, `franka_fr3`, `franka_fr3_v2`, `i2rt_yam`, `kinova_gen3`,
+`low_cost_robot_arm`, `robotis_omy_3m`, `seeed_rebot_devarm`, `trs_so_arm100`,
+`ufactory_lite6`, `ufactory_xarm7`, `unitree_z1`, `universal_robots_ur10e` and
+`universal_robots_ur5e`. The other 11:
+
+| Arms | Result | Why |
+| --- | --- | --- |
+| `aloha`, `dynamixel_2r`, `robotstudio_so101`, `trossen_wxai` | do not load | The model has no keyframe named `home`. The `so101` rig's `desk.xml` adds one |
+| `arx_l5` | does not load | Its camera sets a sensor size |
+| `flexiv_rizon4s`, `franka_fr3_duo`, `kuka_iiwa_14`, `rethink_robotics_sawyer`, `trossen_vx300s`, `trossen_wx250s` | fail step 1 | A joint sags 0.0205 to 0.0713 rad in 2 s, because the backend does not compensate gravity |
+
+A pass says that the backend can drive those joints. It does not say that a
+finished rig exists for that arm: that takes a scene, cameras, and a look at
+what the cameras see. `kinova_gen3` passes on 3 of its 7 joints; the other four
+have no range, and the backend needs one. The sweep downloads 63 MB the first
+time.
 
 ## Camera images
 
@@ -399,7 +529,7 @@ spectator's, can be watched in a browser. `homunculus video` prints a link to it
 ```console
 $ homunculus video overview
 camera overview, live at 20 frames a second:
-  http://127.0.0.1:…/v1/robots/sim-arm/video?camera=overview&until=…&signature=…
+  http://127.0.0.1:…/v1/robots/panda/video?camera=overview&until=…&signature=…
 Open it in a browser within 600 s. Anyone who has the link can watch, without a token.
 ```
 
@@ -571,10 +701,14 @@ Rules a backend keeps:
   a worker thread of its own, as `backends/task.py` does.
 - A problem found while starting is a `StartupError` with a message for the
   person who started the service.
+- `close()` releases what the backend holds, such as a process or a
+  connection. The service calls it when it ends, however it ends, a start that
+  failed included. A backend is a context manager, so code of your own builds
+  one in a `with`.
 - `describe()` says what moves the robot, in its `BackendInfo`: `physics` is
   `none` (a fake that sets its joints as commanded), `simulated`, or `real`.
   `homunculus describe` shows it after the robot's name, as in
-  `sim-arm  (mujoco backend, simulated physics)`.
+  `panda  (mujoco backend, simulated physics)`.
 - `capture()` runs on request threads while the control thread calls
   `advance()`, so it reads the robot's state under a lock of its own, as
   `backends/mujoco.py` does. It returns `Frame`s: the bytes, and a
@@ -610,17 +744,20 @@ store = TargetStore()  # the targets `homunculus connect` / `homunculus demo sta
 # on_change=store.save records the session and the last goal as they change, as the CLI does
 with RobotClient(store.get("fake:arm"), on_change=store.save) as robot:
     print([p.profile for p in robot.describe().profiles])
-    robot.open_session()  # acquire authority; see below if the CLI already holds it
-    goal = robot.submit_goal(GripperWidthGoal(profile="gripper.width/1", target="gripper", width_m=0.03))
-    goal = robot.wait_goal()
-    print(goal.state, goal.result.measurements, goal.retained)
-    robot.close_session()
+    with robot.session():  # takes control for this block; see below if the CLI already holds it
+        robot.submit_goal(GripperWidthGoal(profile="gripper.width/1", target="gripper", width_m=0.03))
+        goal = robot.wait_goal()
+        print(goal.state, goal.result.measurements, goal.retained)
 ```
 
-A robot has one control session. If `homunculus session open` already holds it for
-this target, `open_session()` is refused with `session_conflict`: leave that
-call and `close_session()` out to work in the CLI's session, or release it
-first with `homunculus session close`.
+`robot.session()` takes the control session when its block starts and releases
+it when the block ends, after an error too, so a script that fails does not
+leave the robot held. A robot has one control session. If
+`homunculus session open` already holds it for this target, `robot.session()`
+is refused with `session_conflict`: leave that `with` out to work in the CLI's
+session, or release it first with `homunculus session close`.
+`open_session()` and `close_session()` are for a session that outlives one
+block, as the CLI's does from one command to the next.
 
 ## Running a service yourself
 
@@ -666,8 +803,14 @@ and targets; when no targets remain, `targets.json` and an empty home directory
 are removed too. A `homunculus demo start` that fails, or is ended with Ctrl-C or
 `SIGTERM` before it reports the service, leaves no service and no files.
 
-`images/` holds the camera images `homunculus observe` saved without `--save`.
-Nothing removes them, and a home that holds them is not removed.
+`images/` holds the camera images `homunculus observe` saved without `--save`,
+and the pictures `homunculus install` took. Nothing removes them, and a home
+that holds them is not removed.
+
+The robots that rigs download are not in `$HOMUNCULUS_HOME`. They are in the
+`mujoco-menagerie` package's cache (see
+[Where the robot comes from](#where-the-robot-comes-from)), and no homunculus
+command removes them.
 
 `homunculus demo stop` removes nothing while a process holds the demo's files
 without answering as its service (a suspended or hung service, for example).
@@ -685,8 +828,9 @@ stopped while it was starting.
 ## Limitations
 
 - A prototype for validating the interface. No physical robot, vendor SDK, or
-  native controller is connected. Tested only on macOS arm64 with Python 3.10
-  and 3.12. It needs a POSIX system, for file locks and signals; Windows is not
+  native controller is connected. The tests run on macOS arm64 with Python 3.11,
+  3.13, 3.14 and 3.15.0rc2, and on Linux x86_64 (Debian, in a container) with
+  Python 3.11 and 3.15.2. It needs a POSIX system, for file locks and signals; Windows is not
   supported.
 - The fake robots prove protocol behavior only. `fake:g1` does not simulate
   balance or gait and says so in its description.
@@ -698,7 +842,13 @@ stopped while it was starting.
   The longest interval between control ticks, over a service's first 33 s with
   the viewers watching for 30 s of them, was 18.8 ms with no viewer, 36.7 ms
   with one, and 36.9 ms with four, with no execution lag. MuJoCo rendering is
-  tested on macOS only.
+  tested on macOS, and on Linux x86_64 with Mesa's software renderer.
+- A rig's robot is downloaded from GitHub the first time, so a rig's first
+  start needs the network.
+- The MuJoCo backend does not compensate gravity, needs a keyframe named
+  `home`, and refuses a camera set by sensor size. For those reasons 11 of
+  Menagerie's 28 arms do not pass `homunculus install` as they are (see
+  [Menagerie's arms](#menageries-arms)).
 - Saved camera images are never removed from `$HOMUNCULUS_HOME/images`.
 - Stream updates are separate HTTP requests; a persistent update channel
   is reported as unavailable. No MCP adapter yet.

@@ -16,9 +16,10 @@ import hashlib
 import json
 import sqlite3
 import threading
+from contextlib import closing
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Self
 
 from .models import RobotError
 
@@ -93,7 +94,7 @@ class Journal:
             self._db.executescript(_SCHEMA)
         except sqlite3.DatabaseError as error:
             self._db.close()
-            if "locked" in str(error):  # SQLITE_BUSY; the error code itself is exposed only from Python 3.11
+            if error.sqlite_errorcode == sqlite3.SQLITE_BUSY:
                 raise JournalInUse(str(path)) from None
             raise OSError(f"cannot use the journal {path}: {error}") from None  # not a database, or damaged
 
@@ -172,6 +173,12 @@ class Journal:
         with self._lock:
             self._db.close()
 
+    def __enter__(self) -> Self:
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self.close()
+
     def _one(self, where: str, values: tuple[str, ...]) -> Entry | None:
         with self._lock:
             row = self._db.execute(f"SELECT {_COLUMNS} FROM requests WHERE {where}", values).fetchone()
@@ -184,12 +191,12 @@ def held(path: str | Path) -> bool:
         db = sqlite3.connect(f"{Path(path).resolve().as_uri()}?mode=ro", uri=True, timeout=0.2)
     except sqlite3.OperationalError:  # no such file
         return False
-    try:
-        db.execute("SELECT 1 FROM sqlite_master").fetchone()
-    except sqlite3.DatabaseError as error:
-        return "locked" in str(error)  # anything else is a file no Journal could be holding
-    finally:
-        db.close()
+    with closing(db):
+        try:
+            db.execute("SELECT 1 FROM sqlite_master").fetchone()
+        except sqlite3.DatabaseError as error:
+            # Any other error is from a file no Journal could be holding.
+            return error.sqlite_errorcode == sqlite3.SQLITE_BUSY
     return False
 
 

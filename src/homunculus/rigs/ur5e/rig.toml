@@ -1,0 +1,5 @@
+description = "UR5e arm at a bench, watched by a fixed camera"
+menagerie = "universal_robots_ur5e"
+model = "bench.xml"
+arm = ["shoulder_pan_joint", "shoulder_lift_joint", "elbow_joint", "wrist_1_joint", "wrist_2_joint", "wrist_3_joint"]
+cameras = ["realsense"]

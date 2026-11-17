@@ -181,8 +181,8 @@ def _g1() -> _Robot:
 
 
 def _arm() -> _Robot:
-    # The joints, ranges, and home pose of the Franka Emika Panda that `--backend mujoco` simulates
-    # (assets/franka_emika_panda/panda.xml), so a command for one works on the other.
+    # The joints, ranges, and home pose of the Franka Emika Panda that the mujoco backend's `panda` rig simulates
+    # (panda.xml in MuJoCo Menagerie's franka_emika_panda), so a command for one works on the other.
     ranges = {
         "joint1": (-2.8973, 2.8973),
         "joint2": (-1.7628, 1.7628),

@@ -1,0 +1,6 @@
+description = "SO-101 arm at a desk, with its wrist camera"
+menagerie = "robotstudio_so101"
+model = "desk.xml"
+# The jaw is a hinge, and gripper.width/1 needs fingers that slide, so the jaw is driven as an arm joint.
+arm = ["shoulder_pan", "shoulder_lift", "elbow_flex", "wrist_flex", "wrist_roll", "gripper"]
+cameras = ["wrist_cam"]

@@ -12,6 +12,7 @@ import io
 import itertools
 import json
 import math
+import signal
 import socket
 import sys
 import threading
@@ -26,6 +27,7 @@ import pytest
 import uvicorn
 from pydantic import ValidationError
 
+from homunculus import rigs
 from homunculus.backends.fake import FakeBackend
 from homunculus.cli import main as cli_main
 from homunculus.client import ClientError, RobotClient, Target, TargetStore
@@ -55,9 +57,9 @@ from homunculus.models import (
     ValidateRequest,
     VideoLink,
 )
-from homunculus.profiles import VelocityJudge
+from homunculus.profiles import VelocityJudge, sample_trajectory
 from homunculus.runtime import Backend, BackendFacts, Clock, Frame, Principal, Runtime, StartupError
-from homunculus.server import Service, create_app, load_backends
+from homunculus.server import Service, create_app, load_backends, serve
 
 CLIENT = Principal("client")
 OTHER = Principal("other")
@@ -85,7 +87,7 @@ class ManualClock:
         return self.t
 
 
-class Rig:
+class Harness:
     """One robot behind a runtime, on a clock that only the test advances: a fake one unless `backend` is given."""
 
     def __init__(
@@ -184,13 +186,13 @@ class Rig:
 
 
 @pytest.fixture
-def arm(tmp_path) -> Rig:
-    return Rig(tmp_path / "journal.sqlite", "arm")
+def arm(tmp_path) -> Harness:
+    return Harness(tmp_path / "journal.sqlite", "arm")
 
 
 @pytest.fixture
-def g1(tmp_path) -> Rig:
-    return Rig(tmp_path / "journal.sqlite", "g1")
+def g1(tmp_path) -> Harness:
+    return Harness(tmp_path / "journal.sqlite", "g1")
 
 
 def velocity(forward: float) -> BaseVelocityTarget:
@@ -262,28 +264,28 @@ def test_a_repeated_request_is_one_operation_executed_once(arm):
 # Each case prepares a situation and returns the request that must be refused.
 
 
-def wrong_context(arm: Rig):
+def wrong_context(arm: Harness):
     arm.open()
     return lambda: arm.submit(gripper(0.03), context_id="ctx-000000000000")
 
 
-def expired_session(arm: Rig):
+def expired_session(arm: Harness):
     arm.open(lifetime_wall_s=1.0)
     arm.run(1.5)
     return lambda: arm.submit(gripper(0.03))
 
 
-def closed_session(arm: Rig):
+def closed_session(arm: Harness):
     arm.runtime.close_session(CLIENT, arm.open())
     return lambda: arm.submit(gripper(0.03))
 
 
-def another_principal(arm: Rig):
+def another_principal(arm: Harness):
     arm.open()
     return lambda: arm.submit(gripper(0.03), principal=OTHER)
 
 
-def state_moved_since_observation(arm: Rig):
+def state_moved_since_observation(arm: Harness):
     arm.open()
     seen = arm.runtime.observe()
     assert arm.finish(arm.submit(gripper(0.03)), 1.0).state == "succeeded"
@@ -291,7 +293,7 @@ def state_moved_since_observation(arm: Rig):
     return lambda: arm.submit(gripper(0.06), start_conditions=conditions)
 
 
-def feedback_lost(arm: Rig):
+def feedback_lost(arm: Harness):
     arm.open()
     arm.backend.faults.add(("feedback_loss", "gripper"))
     arm.run(STEP)
@@ -375,23 +377,23 @@ def test_a_goal_past_its_deadline_neither_starts_nor_counts_as_completed(arm):
 def test_a_goal_that_cannot_finish_within_its_deadline_is_refused_before_it_moves(
     tmp_path, robot, action, too_short, enough
 ):
-    rig = Rig(tmp_path / "journal.sqlite", robot)
-    rig.open()
+    harness = Harness(tmp_path / "journal.sqlite", robot)
+    harness.open()
 
     def dry_run(**settings):
-        return rig.runtime.validate(ValidateRequest(goal=GoalSpec(action=action, **settings)))
+        return harness.runtime.validate(ValidateRequest(goal=GoalSpec(action=action, **settings)))
 
     # The motion a request states, and the rest it must then be measured at, end after the deadline does.
-    assert refused(lambda: rig.submit(action, **too_short)) == "limit_exceeded"
+    assert refused(lambda: harness.submit(action, **too_short)) == "limit_exceeded"
     # A dry run checks the goal as it would be submitted, its deadlines and start conditions included.
     assert refused(lambda: dry_run(**too_short)) == "limit_exceeded"
     elsewhere = StartConditions(required_mode="another mode")
     assert refused(lambda: dry_run(**enough, start_conditions=elsewhere)) == "start_condition_failed"
     assert dry_run(**enough).valid
-    assert rig.backend.effects == []
-    assert all(resource.activity is None for resource in rig.runtime.describe().resources)
+    assert harness.backend.effects == []
+    assert all(resource.activity is None for resource in harness.runtime.describe().resources)
 
-    goal = rig.finish(rig.submit(action, **enough), 31.5)
+    goal = harness.finish(harness.submit(action, **enough), 31.5)
     assert (goal.state, goal.result.reason) == ("succeeded", "completed")
 
 
@@ -695,16 +697,16 @@ def test_a_stop_reports_failure_when_standstill_is_not_measured(g1):
 def test_blocked_motion_fails_on_measurement_and_never_succeeds_on_elapsed_time(
     tmp_path, robot, resource, action, settings, reason
 ):
-    rig = Rig(tmp_path / "journal.sqlite", robot)
-    rig.open()
-    rig.backend.faults.add(("blocked", resource))
-    goal = rig.finish(rig.submit(action, **settings), 1.5)
+    harness = Harness(tmp_path / "journal.sqlite", robot)
+    harness.open()
+    harness.backend.faults.add(("blocked", resource))
+    goal = harness.finish(harness.submit(action, **settings), 1.5)
     assert (goal.state, goal.result.reason, goal.result.stop_confirmed) == ("failed", reason, True)
-    assert rig.effects("stop") == [("stop", (resource,))]
+    assert harness.effects("stop") == [("stop", (resource,))]
 
     # The goal failed, not the robot: once it can move again the same action succeeds.
-    rig.backend.faults.clear()
-    assert rig.finish(rig.submit(action), 4.0).state == "succeeded"
+    harness.backend.faults.clear()
+    assert harness.finish(harness.submit(action), 4.0).state == "succeeded"
 
 
 # --------------------------------------------------------------------------
@@ -770,26 +772,27 @@ def test_a_restart_reports_whether_an_interrupted_stream_had_commanded_motion(g1
 
 def test_dropping_old_records_from_memory_never_breaks_a_barrier(tmp_path):
     """Records beyond the retention limit leave memory. That must not cut short a reset or a session's end."""
-    rig = Rig(tmp_path / "journal.sqlite", "arm", limits=ServiceLimits(operation_retention=2))
-    rig.open()
-    earlier = [rig.finish(rig.submit(gripper(width)), 1.0) for width in (0.02, 0.03, 0.04)]
-    assert [rig.runtime.goal(goal.goal_id).state for goal in earlier] == ["succeeded"] * 3  # the first from the journal
+    harness = Harness(tmp_path / "journal.sqlite", "arm", limits=ServiceLimits(operation_retention=2))
+    harness.open()
+    earlier = [harness.finish(harness.submit(gripper(width)), 1.0) for width in (0.02, 0.03, 0.04)]
+    # The first of them is read from the journal.
+    assert [harness.runtime.goal(goal.goal_id).state for goal in earlier] == ["succeeded"] * 3
 
-    moving = rig.submit(reach(joint1=1.0, at=2.0))
-    rig.run(0.5)
-    waiting = rig.submit(gripper(0.05))
-    reset = rig.manage("world.reset", seconds=0.1)
-    assert reset.state == "succeeded" and reset.new_context_id != rig.context
-    assert [rig.runtime.goal(goal.goal_id).state for goal in (moving, waiting)] == ["interrupted", "interrupted"]
+    moving = harness.submit(reach(joint1=1.0, at=2.0))
+    harness.run(0.5)
+    waiting = harness.submit(gripper(0.05))
+    reset = harness.manage("world.reset", seconds=0.1)
+    assert reset.state == "succeeded" and reset.new_context_id != harness.context
+    assert [harness.runtime.goal(goal.goal_id).state for goal in (moving, waiting)] == ["interrupted", "interrupted"]
 
-    rig.context = reset.new_context_id
-    rig.open()
-    undispatched = [rig.submit(reach(joint1=0.5)), rig.submit(gripper(0.02))]
-    applied = len(rig.effects("apply"))
-    assert rig.runtime.close_session(CLIENT, rig.session).state == "closed"
-    rig.run(0.5)
-    assert [rig.runtime.goal(goal.goal_id).state for goal in undispatched] == ["cancelled", "cancelled"]
-    assert len(rig.effects("apply")) == applied
+    harness.context = reset.new_context_id
+    harness.open()
+    undispatched = [harness.submit(reach(joint1=0.5)), harness.submit(gripper(0.02))]
+    applied = len(harness.effects("apply"))
+    assert harness.runtime.close_session(CLIENT, harness.session).state == "closed"
+    harness.run(0.5)
+    assert [harness.runtime.goal(goal.goal_id).state for goal in undispatched] == ["cancelled", "cancelled"]
+    assert len(harness.effects("apply")) == applied
 
 
 def test_a_journal_has_one_owner_at_a_time(tmp_path):
@@ -807,33 +810,33 @@ def test_a_journal_has_one_owner_at_a_time(tmp_path):
 
 def test_a_full_journal_refuses_new_work_but_still_answers_retries_and_stops(tmp_path):
     """Room is made only from retired contexts. Dropping a current identity would let a retry move the robot twice."""
-    rig = Rig(tmp_path / "journal.sqlite", "arm", limits=ServiceLimits(journal_quota=4, operation_retention=2))
-    old_session = rig.open()
-    old_context = rig.context
-    first = rig.finish(rig.submit(gripper(0.03), request_id="first"), 1.0)
+    harness = Harness(tmp_path / "journal.sqlite", "arm", limits=ServiceLimits(journal_quota=4, operation_retention=2))
+    old_session = harness.open()
+    old_context = harness.context
+    first = harness.finish(harness.submit(gripper(0.03), request_id="first"), 1.0)
     for width in (0.05, 0.02):
-        rig.finish(rig.submit(gripper(width)), 1.0)
-    applied = len(rig.effects("apply"))
+        harness.finish(harness.submit(gripper(width)), 1.0)
+    applied = len(harness.effects("apply"))
 
-    assert refused(lambda: rig.submit(gripper(0.04))) == "journal_full"
-    again = rig.submit(gripper(0.03), request_id="first")
+    assert refused(lambda: harness.submit(gripper(0.04))) == "journal_full"
+    again = harness.submit(gripper(0.03), request_id="first")
     assert (again.goal_id, again.state) == (first.goal_id, "succeeded")
-    assert len(rig.effects("apply")) == applied
+    assert len(harness.effects("apply")) == applied
     # A refused request leaves nothing behind: no operation that never finishes, to crowd the record of
     # the stop below out of the two that memory keeps here.
     for attempt in ("reset-1", "reset-2", "reset-3"):
         reset = ManagementRequest(request_id=attempt, context_id=old_context, operation="world.reset")
-        assert refused(lambda reset=reset: rig.runtime.manage(OPERATOR, reset)) == "journal_full"
-    stop = rig.runtime.stop(CLIENT, Authority(session_id=old_session, context_id=old_context))
-    rig.run(1.0)
-    assert rig.runtime.operation(stop.operation_id).state == "succeeded"
-    assert rig.effects("world.reset") == []
+        assert refused(lambda reset=reset: harness.runtime.manage(OPERATOR, reset)) == "journal_full"
+    stop = harness.runtime.stop(CLIENT, Authority(session_id=old_session, context_id=old_context))
+    harness.run(1.0)
+    assert harness.runtime.operation(stop.operation_id).state == "succeeded"
+    assert harness.effects("world.reset") == []
 
-    rig.boot()  # a restart retires that context, so its finished requests make room
-    rig.open()
-    assert rig.finish(rig.submit(gripper(0.04)), 1.0).state == "succeeded"
+    harness.boot()  # a restart retires that context, so its finished requests make room
+    harness.open()
+    assert harness.finish(harness.submit(gripper(0.04)), 1.0).state == "succeeded"
     retry = dict(request_id="first", session_id=old_session, context_id=old_context)
-    assert refused(lambda: rig.submit(gripper(0.03), **retry)) == "stale_context"
+    assert refused(lambda: harness.submit(gripper(0.03), **retry)) == "stale_context"
 
 
 def test_a_world_reset_interrupts_work_and_starts_a_new_context(arm):
@@ -911,7 +914,7 @@ def test_requests_that_end_motion_are_answered_while_every_shared_worker_is_busy
                 async def answer(headers, path, body):
                     try:
                         return await asyncio.wait_for(http.post(robot + path, headers=headers, json=body), 10)
-                    except asyncio.TimeoutError:
+                    except TimeoutError:
                         pytest.fail(f"no answer to POST {path} while the observations wait")
 
                 # Accepted or refused, each is answered now, not when a camera lets a worker go.
@@ -952,15 +955,15 @@ def test_requests_that_end_motion_are_answered_while_every_shared_worker_is_busy
     ],
 )
 def test_a_command_the_description_does_not_offer_is_rejected(tmp_path, robot, action, code):
-    rig = Rig(tmp_path / "journal.sqlite", robot)
-    rig.open()
-    assert refused(lambda: rig.submit(action)) == code
-    rig.run(0.2)
-    assert rig.effects("apply") == []
+    harness = Harness(tmp_path / "journal.sqlite", robot)
+    harness.open()
+    assert refused(lambda: harness.submit(action)) == code
+    harness.run(0.2)
+    assert harness.effects("apply") == []
 
 
 def test_each_description_runs_its_own_profiles_and_declares_what_may_run_together(tmp_path):
-    g1, arm = Rig(tmp_path / "g1.sqlite", "g1"), Rig(tmp_path / "arm.sqlite", "arm")
+    g1, arm = Harness(tmp_path / "g1.sqlite", "g1"), Harness(tmp_path / "arm.sqlite", "arm")
     assert {p.profile for p in g1.runtime.describe().profiles} == {"base.planar_velocity/1", "hand.posture/1"}
     assert {p.profile for p in arm.runtime.describe().profiles} == {"joints.trajectory/1", "gripper.width/1"}
 
@@ -989,20 +992,31 @@ def trajectory(target: str, joints: list[str], positions: list[float], at: float
     return JointTrajectoryGoal(profile="joints.trajectory/1", target=target, joints=joints, points=[point])
 
 
+def test_a_time_between_waypoints_is_sampled_on_the_segment_it_falls_in():
+    """The reference that a trajectory judge compares the measured joints against."""
+    waypoints = ((0.0, 0.0), (1.0, 1.0), (3.0, 2.0), (4.0, 5.0))
+    points = [TrajectoryPoint(time_s=time_s, positions=[q], velocities=[0.0]) for time_s, q in waypoints]
+    # A segment that starts and ends at rest is halfway between its ends at half its time.
+    for time_s, halfway in ((0.5, 0.5), (2.0, 1.5), (3.5, 3.5)):
+        assert sample_trajectory(points, time_s)[0] == pytest.approx([halfway])
+    assert sample_trajectory(points, 3.0) == ([2.0], [0.0])  # on a waypoint: that waypoint
+    assert sample_trajectory(points, 9.0) == ([5.0], [0.0])  # after the last waypoint: the last, at rest
+
+
 def test_a_backend_of_your_own_loads_by_import_path_and_is_judged_on_its_measurements(tmp_path, monkeypatch):
     monkeypatch.syspath_prepend(str(EXAMPLES))
     robots = load_backends("lift:robots", {"gain": "15"})
     assert list(robots) == ["lift"] and robots["lift"].gain == 15.0
     lift = sys.modules["lift"]
 
-    rig = Rig(tmp_path / "lift.sqlite", "lift", backend=lambda clock: lift.Lift(clock, gain=15.0))
-    rig.open()
-    goal = rig.finish(rig.submit(trajectory("lift", ["lift"], [0.5], at=2.0)), 3.0)
+    harness = Harness(tmp_path / "lift.sqlite", "lift", backend=lambda clock: lift.Lift(clock, gain=15.0))
+    harness.open()
+    goal = harness.finish(harness.submit(trajectory("lift", ["lift"], [0.5], at=2.0)), 3.0)
     assert goal.state == "succeeded"
     assert goal.result.measurements["final_error"]["lift"] <= lift.LIMITS.goal_tolerance
 
     # A motor too weak to keep up lags the path, and the same judge fails it on what was measured.
-    weak = Rig(tmp_path / "weak.sqlite", "lift", backend=lambda clock: lift.Lift(clock, gain=1.0))
+    weak = Harness(tmp_path / "weak.sqlite", "lift", backend=lambda clock: lift.Lift(clock, gain=1.0))
     weak.open()
     goal = weak.finish(weak.submit(trajectory("lift", ["lift"], [0.5], at=2.0)), 3.0)
     assert (goal.state, goal.result.reason) == ("failed", "path_tolerance_violated")
@@ -1019,7 +1033,51 @@ def test_a_backend_whose_samples_lack_positions_or_velocities_is_refused_at_star
             return feedback
 
     with pytest.raises(StartupError, match="no positions and velocities maps for resource 'lift'"):
-        Rig(tmp_path / "unmeasured.sqlite", "lift", backend=lambda clock: Unmeasured(clock, gain=15.0))
+        Harness(tmp_path / "unmeasured.sqlite", "lift", backend=lambda clock: Unmeasured(clock, gain=15.0))
+
+
+def test_a_service_that_cannot_start_closes_the_backend_it_built(tmp_path, monkeypatch):
+    """The backend is built, and then its runtime refuses it. Nothing it holds may outlive that."""
+    (tmp_path / "unmeasured.py").write_text(
+        "import pathlib\n"
+        "import lift\n"
+        "from homunculus.runtime import SystemClock\n\n\n"
+        "class Unmeasured(lift.Lift):\n"
+        "    def advance(self):\n"
+        "        feedback = super().advance()\n"
+        "        del feedback.samples['lift'].values['velocities']\n"
+        "        return feedback\n\n"
+        "    def close(self):\n"
+        "        pathlib.Path(__file__).with_name('closed').touch()\n\n\n"
+        "def robots():\n"
+        "    return {'lift': Unmeasured(SystemClock(), gain=15.0)}\n"
+    )
+    monkeypatch.syspath_prepend(str(EXAMPLES))
+    monkeypatch.syspath_prepend(str(tmp_path))
+    monkeypatch.setattr(signal, "signal", lambda *_: None)  # serve() takes over SIGTERM; this process keeps its own
+    home = tmp_path / "home"
+    with pytest.raises(StartupError, match="no positions and velocities maps for resource 'lift'"):
+        serve("unmeasured:robots", {}, home)
+    assert (tmp_path / "closed").exists()
+    assert not (home / "service.json").exists() and not held(home / "journal.sqlite")
+
+
+def test_a_session_held_for_a_block_is_released_however_the_block_ends(tmp_path, monkeypatch):
+    harness = Harness(tmp_path / "journal.sqlite", "arm")
+    service = Service({"fake-arm": harness.runtime}, {"client-token": CLIENT}, "boot-00000001", ServiceLimits())
+    monkeypatch.setenv("HOMUNCULUS_HOME", str(tmp_path / "home"))
+    with serving(service) as url:
+        store = TargetStore()
+        store.connect(url, "client-token")
+        with RobotClient(store.get("fake:arm")) as robot:
+            with robot.session() as session:
+                assert robot.describe().session.held and session.state == "active"
+            assert not robot.describe().session.held
+
+            with pytest.raises(RuntimeError, match="in the block"), robot.session():
+                raise RuntimeError("in the block")
+            assert not robot.describe().session.held
+            robot.open_session()  # so nothing refuses it with session_conflict
 
 
 @pytest.mark.parametrize(
@@ -1061,25 +1119,28 @@ TWO_JOINTS = """
 """
 
 
-def test_the_mujoco_backend_drives_a_model_of_your_own(tmp_path):
+def two_joints(folder: Path, model: str = TWO_JOINTS) -> Path:
+    """A rig folder of your own: the model, and a rig.toml that names it and the joints to drive."""
+    folder.mkdir()
+    (folder / "two.xml").write_text(model)
+    (folder / "rig.toml").write_text('description = "two joints"\nmodel = "two.xml"\narm = ["swing", "reach"]\n')
+    return folder
+
+
+def test_the_mujoco_backend_drives_a_rig_of_your_own(tmp_path):
     pytest.importorskip("mujoco")
     from homunculus.backends.mujoco import MujocoBackend
 
-    model = tmp_path / "two.xml"
-    model.write_text(TWO_JOINTS)
-    robots = load_backends(
-        "mujoco", {"model": str(model), "arm": "swing,reach", "gripper": "", "cameras": "", "robot_id": "two"}
-    )
-    assert list(robots) == ["two"]
+    folder = two_joints(tmp_path / "two")
+    assert list(load_backends("mujoco", {"rig": str(folder)})) == ["two"]  # named after its folder
+    assert list(load_backends("mujoco", {"rig": str(folder), "robot_id": "left"})) == ["left"]
 
-    rig = Rig(
-        tmp_path / "two.sqlite", "two", backend=lambda clock: MujocoBackend(clock, model, ["swing", "reach"], [], [])
-    )
-    description = rig.runtime.describe()
+    harness = Harness(tmp_path / "two.sqlite", "two", backend=lambda clock: MujocoBackend(clock, folder))
+    description = harness.runtime.describe()
     assert [(b.profile, b.target) for b in description.profiles] == [("joints.trajectory/1", "arm")]
     assert [joint.unit for joint in description.profiles[0].limits.joints] == ["rad", "m"]
-    rig.open()
-    goal = rig.finish(rig.submit(trajectory("arm", ["swing", "reach"], [0.8, 0.15], at=2.0)), 3.0)
+    harness.open()
+    goal = harness.finish(harness.submit(trajectory("arm", ["swing", "reach"], [0.8, 0.15], at=2.0)), 3.0)
     assert goal.state == "succeeded"
     assert max(goal.result.measurements["final_error"].values()) <= 0.02
 
@@ -1097,10 +1158,9 @@ def test_the_mujoco_backend_drives_a_model_of_your_own(tmp_path):
 )
 def test_a_mujoco_model_the_backend_cannot_drive_is_refused_with_the_reason(tmp_path, change, says):
     pytest.importorskip("mujoco")
-    model = tmp_path / "two.xml"
-    model.write_text(TWO_JOINTS.replace(*change))
+    folder = two_joints(tmp_path / "two", TWO_JOINTS.replace(*change))
     with pytest.raises(StartupError, match=says):
-        load_backends("mujoco", {"model": str(model), "arm": "swing,reach", "gripper": "", "cameras": ""})
+        load_backends("mujoco", {"rig": str(folder)})
 
 
 WALKING = BaseVelocityLimits(
@@ -1369,19 +1429,18 @@ def eventually(condition: Callable[[], bool], within_s: float = 5.0) -> bool:
 def serving(service: Service) -> Iterator[str]:
     """The service on a free local port, as `homunculus serve` runs it: a video response never ends, so it is read
     from a real connection."""
-    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    listener.bind(("127.0.0.1", 0))
-    listener.listen()
-    server = uvicorn.Server(uvicorn.Config(create_app(service), log_level="warning", timeout_graceful_shutdown=1))
-    thread = threading.Thread(target=server.run, kwargs={"sockets": [listener]})
-    thread.start()
-    try:
-        assert eventually(lambda: server.started, within_s=10)
-        yield f"http://127.0.0.1:{listener.getsockname()[1]}"
-    finally:
-        server.should_exit = True
-        thread.join(10)
-        listener.close()
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+        listener.bind(("127.0.0.1", 0))
+        listener.listen()
+        server = uvicorn.Server(uvicorn.Config(create_app(service), log_level="warning", timeout_graceful_shutdown=1))
+        thread = threading.Thread(target=server.run, kwargs={"sockets": [listener]})
+        thread.start()
+        try:
+            assert eventually(lambda: server.started, within_s=10)
+            yield f"http://127.0.0.1:{listener.getsockname()[1]}"
+        finally:
+            server.should_exit = True  # a thread has no `with`: it is told to end and waited for here
+            thread.join(10)
 
 
 def video_parts(chunks: Iterator[bytes]) -> Iterator[tuple[str, bytes]]:
@@ -1402,9 +1461,9 @@ def video_parts(chunks: Iterator[bytes]) -> Iterator[tuple[str, bytes]]:
 
 
 def test_a_camera_plays_live_through_a_link_that_needs_no_token(tmp_path, monkeypatch, capsys):
-    rig = Rig(tmp_path / "journal.sqlite", "fake-arm", backend=Filmed)
+    harness = Harness(tmp_path / "journal.sqlite", "fake-arm", backend=Filmed)
     limits = ServiceLimits(max_video_viewers=1)
-    service = Service({"fake-arm": rig.runtime}, {"client-token": CLIENT}, "boot-00000001", limits)
+    service = Service({"fake-arm": harness.runtime}, {"client-token": CLIENT}, "boot-00000001", limits)
     with serving(service) as url:
         monkeypatch.setenv("HOMUNCULUS_HOME", str(tmp_path / "home"))
         store = TargetStore()
@@ -1428,8 +1487,8 @@ def test_a_camera_plays_live_through_a_link_that_needs_no_token(tmp_path, monkey
 
 def test_observe_saves_the_robots_camera_images_and_says_how_each_was_taken(tmp_path, monkeypatch, capsys):
     """An agent gets a file it can open, not a handle no command takes. A spectator camera is never recorded."""
-    rig = Rig(tmp_path / "journal.sqlite", "fake-arm", backend=Filmed)
-    service = Service({"fake-arm": rig.runtime}, {"client-token": CLIENT}, "boot-00000001", ServiceLimits())
+    harness = Harness(tmp_path / "journal.sqlite", "fake-arm", backend=Filmed)
+    service = Service({"fake-arm": harness.runtime}, {"client-token": CLIENT}, "boot-00000001", ServiceLimits())
     with serving(service) as url:
         monkeypatch.setenv("HOMUNCULUS_HOME", str(tmp_path / "home"))
         store = TargetStore()
@@ -1458,49 +1517,43 @@ def test_observe_saves_the_robots_camera_images_and_says_how_each_was_taken(tmp_
         assert "spectators  gallery (live video, 50 fps)" in described
 
 
-def test_the_task_states_its_camera_as_mujoco_does_once_converted(tmp_path):
+def test_the_task_states_its_camera_as_mujoco_does_once_converted(panda):
     """The task simulator sends a MuJoCo camera's own numbers; converted, they match the MuJoCo backend's."""
     pytest.importorskip("PIL")
     from homunculus.backends.task import _camera_image
 
-    rig = panda(tmp_path)
-    try:
-        frame = rig.backend.capture("wrist")[0]
-        model, shown = rig.backend._model, rig.backend._shown
-        camera = model.camera("wrist").id
-        task = _camera_image(
-            {
-                "width": 640,
-                "height": 480,
-                "focal_px": 480 / (2 * math.tan(math.radians(model.cam_fovy[camera]) / 2)),
-                "camera_position": shown.cam_xpos[camera].tolist(),
-                "world_from_camera": shown.cam_xmat[camera].reshape(3, 3).tolist(),
-                "sim_time": shown.time,
-            },
-            "state",
-        )
-        ours = frame.image
-        assert task.focal_px == pytest.approx(ours.focal_px) and task.principal_px == ours.principal_px
-        assert task.camera_pose.position_m == pytest.approx(ours.camera_pose.position_m)
-        same = sum(
-            a * b for a, b in zip(task.camera_pose.orientation_xyzw, ours.camera_pose.orientation_xyzw, strict=True)
-        )
-        assert abs(same) == pytest.approx(1.0)  # q and -q are the same rotation
-    finally:
-        rig.backend.close()
+    frame = panda.backend.capture("wrist")[0]
+    model, shown = panda.backend._model, panda.backend._shown
+    camera = model.camera("wrist").id
+    task = _camera_image(
+        {
+            "width": 640,
+            "height": 480,
+            "focal_px": 480 / (2 * math.tan(math.radians(model.cam_fovy[camera]) / 2)),
+            "camera_position": shown.cam_xpos[camera].tolist(),
+            "world_from_camera": shown.cam_xmat[camera].reshape(3, 3).tolist(),
+            "sim_time": shown.time,
+        },
+        "state",
+    )
+    ours = frame.image
+    assert task.focal_px == pytest.approx(ours.focal_px) and task.principal_px == ours.principal_px
+    assert task.camera_pose.position_m == pytest.approx(ours.camera_pose.position_m)
+    same = sum(a * b for a, b in zip(task.camera_pose.orientation_xyzw, ours.camera_pose.orientation_xyzw, strict=True))
+    assert abs(same) == pytest.approx(1.0)  # q and -q are the same rotation
 
 
 def test_a_viewer_who_leaves_before_the_first_frame_gives_its_place_back(tmp_path, monkeypatch):
     """Otherwise each such viewer would hold a place until the service restarts."""
-    rig = Rig(tmp_path / "journal.sqlite", "fake-arm", backend=Filmed)
-    service = Service({"fake-arm": rig.runtime}, {"client-token": CLIENT}, "boot-00000001", ServiceLimits())
-    left, capture = threading.Event(), rig.backend.capture
+    harness = Harness(tmp_path / "journal.sqlite", "fake-arm", backend=Filmed)
+    service = Service({"fake-arm": harness.runtime}, {"client-token": CLIENT}, "boot-00000001", ServiceLimits())
+    left, capture = threading.Event(), harness.backend.capture
 
     def held(sensor: str) -> list[Frame]:
         left.wait(10)  # the first frame is still being captured when the viewer leaves
         return capture(sensor)
 
-    monkeypatch.setattr(rig.backend, "capture", held)
+    monkeypatch.setattr(harness.backend, "capture", held)
     until = int(time.time()) + 60
     query = httpx.QueryParams(
         camera="front", until=until, signature=service.video_signature("fake-arm", "front", until)
@@ -1517,8 +1570,8 @@ def test_a_viewer_who_leaves_before_the_first_frame_gives_its_place_back(tmp_pat
 
 def test_a_video_that_cannot_play_is_refused_with_the_reason(tmp_path, monkeypatch):
     """A browser shows the refusal, so a video that will not play never looks like a blank one."""
-    rig = Rig(tmp_path / "journal.sqlite", "fake-arm", backend=Filmed)
-    service = Service({"fake-arm": rig.runtime}, {"client-token": CLIENT}, "boot-00000001", ServiceLimits())
+    harness = Harness(tmp_path / "journal.sqlite", "fake-arm", backend=Filmed)
+    service = Service({"fake-arm": harness.runtime}, {"client-token": CLIENT}, "boot-00000001", ServiceLimits())
     robot = "/v1/robots/fake-arm"
     with serving(service) as url, httpx.Client(base_url=url, timeout=10) as http:
         no_token = http.get(f"{robot}/video-link", params={"camera": "front"})
@@ -1542,7 +1595,7 @@ def test_a_video_that_cannot_play_is_refused_with_the_reason(tmp_path, monkeypat
         signature = service.video_signature("fake-arm", "front", until)
         assert refusal("wrist", until, signature)["code"] == "unauthenticated"  # made for another camera
         assert refusal("front", until + 600, signature)["code"] == "unauthenticated"  # its time moved on
-        earlier = Service({"fake-arm": rig.runtime}, {}, "boot-00000000", ServiceLimits())  # restarted since
+        earlier = Service({"fake-arm": harness.runtime}, {}, "boot-00000000", ServiceLimits())  # restarted since
         assert refusal("front", until, earlier.video_signature("fake-arm", "front", until))["code"] == "unauthenticated"
         past = int(time.time()) - 1
         expired = refusal("front", past, service.video_signature("fake-arm", "front", past))
@@ -1556,7 +1609,7 @@ def test_a_video_that_cannot_play_is_refused_with_the_reason(tmp_path, monkeypat
         def unplugged(sensor: str) -> list[Frame]:
             raise RobotError("backend_error", f"camera {sensor!r} is unplugged")
 
-        monkeypatch.setattr(rig.backend, "capture", unplugged)
+        monkeypatch.setattr(harness.backend, "capture", unplugged)
         failed = refusal("front", until, signature)
         assert (failed["code"], failed["message"], service.viewers) == (
             "backend_error",
@@ -1565,103 +1618,95 @@ def test_a_video_that_cannot_play_is_refused_with_the_reason(tmp_path, monkeypat
         )
 
 
-def panda(tmp_path) -> Rig:
-    """The Franka Emika Panda that `--backend mujoco` serves, on the test's clock."""
+@pytest.fixture
+def panda(tmp_path) -> Iterator[Harness]:
+    """The Franka Emika Panda that `--backend mujoco` serves, on the test's clock.
+
+    Its files come from MuJoCo Menagerie: downloaded the first time, then read from Menagerie's cache. Its
+    backend closes when the test ends, which frees the renderer on the renderer's own thread.
+    """
     pytest.importorskip("mujoco")
-    from homunculus.backends.mujoco import PANDA, MujocoBackend
+    from homunculus.backends.mujoco import MujocoBackend
 
-    return Rig(
-        tmp_path / "sim.sqlite",
-        "sim-arm",
-        backend=lambda clock: MujocoBackend(clock, PANDA, ARM_JOINTS, FINGER_JOINTS, ["wrist", "workspace"]),
-    )
+    harness = Harness(tmp_path / "sim.sqlite", "panda", backend=lambda clock: MujocoBackend(clock, rigs.find("panda")))
+    with harness.backend:
+        yield harness
 
 
-def test_the_fake_arm_is_the_simulated_panda_without_physics(tmp_path):
-    fake, sim = Rig(tmp_path / "fake.sqlite", "arm"), panda(tmp_path)
+def test_the_fake_arm_is_the_simulated_panda_without_physics(tmp_path, panda):
+    fake, sim = Harness(tmp_path / "fake.sqlite", "arm"), panda
 
-    def ranges(rig: Rig) -> tuple[list[tuple[str, float, float]], float, float]:
-        limits = {binding.profile: binding.limits for binding in rig.runtime.describe().profiles}
+    def ranges(harness: Harness) -> tuple[list[tuple[str, float, float]], float, float]:
+        limits = {binding.profile: binding.limits for binding in harness.runtime.describe().profiles}
         arm, gripper = limits["joints.trajectory/1"], limits["gripper.width/1"]
         return [(j.name, j.min_position, j.max_position) for j in arm.joints], gripper.min_width_m, gripper.max_width_m
 
-    try:
-        assert ranges(fake) == ranges(sim)
-        start = [rig.runtime.observe().samples["arm"].values["positions"] for rig in (fake, sim)]
-        assert start[0] == pytest.approx(PANDA_HOME) and start[1] == pytest.approx(PANDA_HOME, abs=1e-3)
-    finally:
-        sim.backend.close()
+    assert ranges(fake) == ranges(sim)
+    start = [harness.runtime.observe().samples["arm"].values["positions"] for harness in (fake, sim)]
+    assert start[0] == pytest.approx(PANDA_HOME) and start[1] == pytest.approx(PANDA_HOME, abs=1e-3)
 
 
-def test_the_simulated_panda_closes_its_gripper_through_its_one_tendon_actuator(tmp_path):
-    rig = panda(tmp_path)
-    try:
-        rig.open()
-        goal = rig.finish(rig.submit(gripper(0.02)), 2.0)
-        assert goal.state == "succeeded"
-        fingers = rig.runtime.observation(goal.result.completion_observation_id).samples["gripper"].values
-        assert fingers["width_m"] == pytest.approx(0.02, abs=0.003)
-        # One actuator pulls a tendon over both fingers; the model's equality constraint keeps them level.
-        assert fingers["positions"]["finger_joint1"] == pytest.approx(fingers["positions"]["finger_joint2"], abs=1e-3)
-    finally:
-        rig.backend.close()
+def test_the_simulated_panda_closes_its_gripper_through_its_one_tendon_actuator(panda):
+    panda.open()
+    goal = panda.finish(panda.submit(gripper(0.02)), 2.0)
+    assert goal.state == "succeeded"
+    fingers = panda.runtime.observation(goal.result.completion_observation_id).samples["gripper"].values
+    assert fingers["width_m"] == pytest.approx(0.02, abs=0.003)
+    # One actuator pulls a tendon over both fingers; the model's equality constraint keeps them level.
+    assert fingers["positions"]["finger_joint1"] == pytest.approx(fingers["positions"]["finger_joint2"], abs=1e-3)
 
 
-def test_the_simulated_panda_sees_through_its_own_cameras_and_says_where_each_one_was(tmp_path):
+def test_the_simulated_panda_sees_through_its_own_cameras_and_says_where_each_one_was(panda):
     """The lens and pose each image carries map a point of the world onto the pixel that shows it."""
     image_module = pytest.importorskip("PIL.Image")
-    rig = panda(tmp_path)
-    try:
-        cameras = {sensor.id: sensor.kind for sensor in rig.runtime.describe().sensors if "camera" in sensor.kind}
-        assert cameras == {"wrist": "camera", "workspace": "camera", "overview": "spectator_camera"}
-        with pytest.raises(RobotError, match="for people watching its live video") as refused:
-            rig.runtime.observe(["overview"])
-        assert refused.value.details["cameras"] == ["workspace", "wrist"]
-        assert rig.runtime.video_fps("overview") == 20.0  # people can still watch it
+    cameras = {sensor.id: sensor.kind for sensor in panda.runtime.describe().sensors if "camera" in sensor.kind}
+    assert cameras == {"wrist": "camera", "workspace": "camera", "overview": "spectator_camera"}
+    with pytest.raises(RobotError, match="for people watching its live video") as refused:
+        panda.runtime.observe(["overview"])
+    assert refused.value.details["cameras"] == ["workspace", "wrist"]
+    assert panda.runtime.video_fps("overview") == 20.0  # people can still watch it
 
-        # Above the mug, as an agent would put the hand before grasping it.
-        rig.open()
-        above = reach(
-            joint1=0.0979,
-            joint2=0.1032,
-            joint3=0.1297,
-            joint4=-2.2497,
-            joint5=-0.0176,
-            joint6=2.3383,
-            joint7=-2.117,
-            at=3.0,
-        )
-        assert rig.finish(rig.submit(above), 4.0).state == "succeeded"
-        observation = rig.runtime.observe(["wrist", "workspace"])
-        assert [(i.sensor, i.kind, i.media_type, i.width, i.height) for i in observation.images] == [
-            ("wrist", "rgb", "image/jpeg", 640, 480),
-            ("workspace", "rgb", "image/jpeg", 640, 480),
+    # Above the mug, as an agent would put the hand before grasping it.
+    panda.open()
+    above = reach(
+        joint1=0.0979,
+        joint2=0.1032,
+        joint3=0.1297,
+        joint4=-2.2497,
+        joint5=-0.0176,
+        joint6=2.3383,
+        joint7=-2.117,
+        at=3.0,
+    )
+    assert panda.finish(panda.submit(above), 4.0).state == "succeeded"
+    observation = panda.runtime.observe(["wrist", "workspace"])
+    assert [(i.sensor, i.kind, i.media_type, i.width, i.height) for i in observation.images] == [
+        ("wrist", "rgb", "image/jpeg", 640, 480),
+        ("workspace", "rgb", "image/jpeg", 640, 480),
+    ]
+    mug = panda.backend._data.body("mug").xpos.copy()
+    for image in observation.images:
+        # The mug's origin, seen from the camera, then projected through the lens.
+        x, y, z, w = image.camera_pose.orientation_xyzw
+        rotation = [  # world from camera
+            [1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)],
+            [2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
+            [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)],
         ]
-        mug = rig.backend._data.body("mug").xpos.copy()
-        for image in observation.images:
-            # The mug's origin, seen from the camera, then projected through the lens.
-            x, y, z, w = image.camera_pose.orientation_xyzw
-            rotation = [  # world from camera
-                [1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)],
-                [2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
-                [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)],
-            ]
-            offset = [m - c for m, c in zip(mug, image.camera_pose.position_m, strict=True)]
-            seen = [sum(rotation[row][axis] * offset[row] for row in range(3)) for axis in range(3)]
-            assert seen[2] > 0  # in front of the camera
-            column = image.focal_px[0] * seen[0] / seen[2] + image.principal_px[0]
-            row = image.focal_px[1] * seen[1] / seen[2] + image.principal_px[1]
-            _, jpeg = rig.runtime.image(image.handle)
-            red, green, blue = image_module.open(io.BytesIO(jpeg)).convert("RGB").getpixel((round(column), round(row)))
-            assert blue > red + 20 and green > red + 20, (
-                image.sensor,
-                column,
-                row,
-            )  # the blue-green mug, not the table
+        offset = [m - c for m, c in zip(mug, image.camera_pose.position_m, strict=True)]
+        seen = [sum(rotation[row][axis] * offset[row] for row in range(3)) for axis in range(3)]
+        assert seen[2] > 0  # in front of the camera
+        column = image.focal_px[0] * seen[0] / seen[2] + image.principal_px[0]
+        row = image.focal_px[1] * seen[1] / seen[2] + image.principal_px[1]
+        _, jpeg = panda.runtime.image(image.handle)
+        red, green, blue = image_module.open(io.BytesIO(jpeg)).convert("RGB").getpixel((round(column), round(row)))
+        assert blue > red + 20 and green > red + 20, (
+            image.sensor,
+            column,
+            row,
+        )  # the blue-green mug, not the table
 
-        moved = rig.runtime.video_frame("overview")
-        assert moved.image.media_type == "image/jpeg" and moved.data.startswith(b"\xff\xd8")
-        assert int(moved.image.capture_time_ns) >= int(observation.images[0].capture_time_ns)
-        assert moved.image.clock_epoch == observation.images[0].clock_epoch == rig.runtime.describe().world_id
-    finally:
-        rig.backend.close()  # frees the renderer on its own thread; from any other it would wait forever
+    moved = panda.runtime.video_frame("overview")
+    assert moved.image.media_type == "image/jpeg" and moved.data.startswith(b"\xff\xd8")
+    assert int(moved.image.capture_time_ns) >= int(observation.images[0].capture_time_ns)
+    assert moved.image.clock_epoch == observation.images[0].clock_epoch == panda.runtime.describe().world_id

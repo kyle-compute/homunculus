@@ -24,7 +24,7 @@ from abc import ABC, abstractmethod
 from collections import OrderedDict
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
-from typing import Any, Literal, Protocol
+from typing import Any, Literal, Protocol, Self
 
 from .history import History
 from .journal import Entry, Journal, digest
@@ -218,7 +218,16 @@ class Backend(ABC):
         raise NotImplementedError(f"{type(self).__name__} advertises camera {sensor} but does not implement capture()")
 
     def close(self) -> None:  # noqa: B027 - optional: most backends hold nothing that outlives them
-        """Release what the backend holds: processes, connections, files. Nothing by default."""
+        """Release what the backend holds: processes, connections, files. Nothing by default.
+
+        The code that builds a backend closes it, by building it in a `with`. The runtime does not.
+        """
+
+    def __enter__(self) -> Self:
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self.close()
 
 
 # --------------------------------------------------------------------------
@@ -385,13 +394,15 @@ class Runtime:
             self._trim(self._operations, lambda op: op.state != "running")
 
     def close(self) -> None:
-        """Leave the robot under its fallback. Unfinished work is interrupted on the next boot."""
+        """Leave the robot under its fallback. Unfinished work is interrupted on the next boot.
+
+        The backend stays open for whoever built it to close.
+        """
         with self._lock:
             try:
                 self._backend.stop(list(self._resources))
-            except Exception:
+            except Exception:  # the other robots of the service are still to be stopped
                 log.exception("backend stop failed during shutdown")
-            self._backend.close()
 
     def _read_backend(self) -> Feedback:
         try:
