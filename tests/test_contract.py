@@ -35,6 +35,7 @@ from homunculus.backends.fake import FakeBackend
 from homunculus.backends.task import TaskBackend, _start_simulator
 from homunculus.cli import main as cli_main
 from homunculus.client import ClientError, RobotClient, Target, TargetStore
+from homunculus.grasp import GripperGraspGoal
 from homunculus.journal import Journal, JournalInUse, held
 from homunculus.models import (
     Authority,
@@ -1513,6 +1514,56 @@ def test_jaws_stopped_on_an_object_keep_squeezing_when_the_goal_ends(tmp_path, m
     assert goal.state == "failed" and goal.result.reason == "width_not_reached"
     # The stop that ends the failed goal holds the jaws at the closed request, not at the 5 cm they measure.
     assert openings and all(opening == 0.0 for opening in openings)
+
+
+@pytest.mark.parametrize(
+    ("stops_at_m", "state", "reason"),
+    [(0.05, "succeeded", "completed"), (0.0, "failed", "nothing_grasped")],
+    ids=["on-an-object", "on-nothing"],
+)
+def test_a_grasp_succeeds_only_when_an_object_stops_the_jaws_and_keeps_them_closed(
+    tmp_path, monkeypatch, stops_at_m, state, reason
+):
+    state_doc = task_state()
+    hands = state_doc["robot"]["hands"]
+    hands["left"] = {**hands["left"], "gap_m": 0.1, "requested_opening": 1.0}
+    openings = []
+
+    def simulator(request):
+        if request.url.path == "/health":
+            return httpx.Response(200, json={"ready": True})
+        if request.method == "POST":
+            body = json.loads(request.content)
+            if body["action"] == "grip":
+                hands["left"] = {**hands["left"], "gap_m": stops_at_m, "requested_opening": body["opening"]}
+            if "openings" in body:
+                openings.append(body["openings"]["left"])
+            state_doc["sim_time"] += body.get("seconds", 0.0)
+        return httpx.Response(200, json=state_doc)
+
+    client = httpx.Client(transport=httpx.MockTransport(simulator), base_url="http://simulator")
+    monkeypatch.setattr(httpx, "Client", lambda **_: client)
+    with Harness(
+        tmp_path / "journal.sqlite", "task", backend=lambda _: TaskBackend("test", "http://simulator", epoch="test")
+    ) as task:
+        task.open()
+        inverted = GripperGraspGoal(
+            profile="gripper.grasp/1", target="left_gripper", min_width_m=0.06, max_width_m=0.05
+        )
+        assert refused(lambda: task.submit(inverted)) == "limit_exceeded"
+        goal = task.submit(GripperGraspGoal(profile="gripper.grasp/1", target="left_gripper"))
+        deadline = time.monotonic() + 10
+        while (goal := task.runtime.goal(goal.goal_id)).state not in ("succeeded", "failed", "cancelled"):
+            assert time.monotonic() < deadline
+            task.run(STEP)
+            time.sleep(0.002)
+        drained = threading.Event()
+        task.backend._commands.put(drained.set)
+        assert drained.wait(5)
+    assert (goal.state, goal.result.reason) == (state, reason)
+    assert goal.result.measurements["width_m"] == stops_at_m
+    # Whatever the verdict, the jaws stay asked to close: nothing they hold is let go.
+    assert hands["left"]["requested_opening"] == 0.0 and all(opening == 0.0 for opening in openings)
 
 
 @pytest.mark.parametrize("launch_child", [False, True])

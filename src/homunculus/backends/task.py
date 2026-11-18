@@ -4,11 +4,12 @@ The task's source, physics, assets, and verifier stay where they were
 downloaded; nothing is copied or modified. Either this module starts the task's
 unchanged simulator entry point with an interpreter the user supplies, or it
 attaches to that simulator already running, as the task's own containers run
-it. It maps four profiles onto the motor controls the simulator offers over HTTP:
+it. It maps five profiles onto the motor controls the simulator offers over HTTP:
 
     base.planar_velocity/1 (timed goal)   ->  repeated `step` actions with base_velocity,
                                               judged against the base velocity the task measures
     gripper.width/1 on the left gripper   ->  one `grip` action
+    gripper.grasp/1 on the left gripper   ->  one `grip` action to closed, judged on the gap the jaws stop at
     tool.pose.linear/1 on either hand     ->  repeated `step` actions with a hand target moving along
                                               the straight segment, judged against the measured tool site
     tool.pose.linear/1 on both_hands      ->  the same for the left tool site, with the right hand target
@@ -45,6 +46,7 @@ from typing import Any
 
 import httpx
 
+from ..grasp import GraspJudge, GripperGraspGoal, GripperGraspLimits
 from ..models import (
     BackendInfo,
     BaseVelocityGoal,
@@ -509,6 +511,23 @@ class TaskBackend(Backend):
                     ),
                     **common,
                 ),
+                ProfileBinding(
+                    profile="gripper.grasp/1",
+                    target="left_gripper",
+                    role="left_gripper",
+                    resources=["left_gripper"],
+                    controller="task gripper controller",
+                    assistance="the task closes the jaws over one simulated second; they keep squeezing afterwards",
+                    stop_deadline_wall_s=15.0,
+                    limits=GripperGraspLimits(
+                        profile="gripper.grasp/1",
+                        max_width_m=MAX_GAP_M,
+                        empty_width_m=0.01,  # closed on nothing, the jaws measure about 0
+                        still_tolerance_m=GAP_STILL_M,
+                        settle_time_s=SETTLE_S,
+                    ),
+                    **common,
+                ),
                 *(
                     ProfileBinding(
                         profile="tool.pose.linear/1",
@@ -579,6 +598,7 @@ class TaskBackend(Backend):
         run: Callable[..., None] = {
             BaseVelocityGoal: self._travel,
             GripperWidthGoal: self._grip,
+            GripperGraspGoal: self._grasp,
             ToolPoseGoal: self._pose,
             HandPostureGoal: self._posture,
         }[type(contract.action)]
@@ -878,6 +898,31 @@ class TaskBackend(Backend):
             detail = "the jaws did not hold the requested width; something may be between them"
             status = ActivityStatus("failed", measurements, error="width_not_reached", detail=detail)
         status.measurements.update(touch_normal_force_N=hand["touch_normal_force_N"], at_rest=rested >= SETTLE_S)
+        self._report(activity_id, status)
+
+    def _grasp(self, activity_id: str, judge: GraspJudge) -> None:
+        """One `grip` action to closed, then steps at rest until the judge decides from the gap the jaws stopped at.
+        The jaws stay asked to close, so whatever they hold stays squeezed after the goal ends."""
+        if self._skip(activity_id):
+            return
+        try:
+            self._act({"action": "grip", "hand": "left", "opening": 0.0})
+            self._report(activity_id, ActivityStatus("finishing"))
+            rested, status = self._rest(
+                ["left_gripper"],
+                activity_id=activity_id,
+                until=lambda robot: judge.update(robot["hands"]["left"]["gap_m"], SETTLE_STEP_S),
+            )
+        except _Refused as refusal:
+            self._report(activity_id, ActivityStatus("failed", error="task_rejected", detail=str(refusal)))
+            return
+        with self._lock:
+            hand = self._robot["hands"]["left"]
+            self._settled["left_gripper"] = rested >= SETTLE_S
+        if status.phase not in ("done", "failed"):
+            detail = f"the jaws did not stop within {SETTLE_LIMIT_S:g} simulated seconds"
+            status = ActivityStatus("failed", {"width_m": hand["gap_m"]}, error="grasp_not_settled", detail=detail)
+        status.measurements.update(touch_normal_force_N=hand["touch_normal_force_N"])
         self._report(activity_id, status)
 
     def _pose(self, activity_id: str, judge: PoseJudge) -> None:
