@@ -7,7 +7,9 @@ attaches to that simulator already running, as the task's own containers run
 it. It maps five profiles onto the motor controls the simulator offers over HTTP:
 
     base.planar_velocity/1 (timed goal)   ->  repeated `step` actions with base_velocity,
-                                              judged against the base velocity the task measures
+                                              judged against the base velocity the task measures;
+                                              with hands_follow_base, each step also carries both
+                                              hand targets with the measured base
     gripper.width/1 on the left gripper   ->  one `grip` action
     gripper.grasp/1 on the left gripper   ->  one `grip` action to closed, judged on the gap the jaws stop at
     tool.pose.linear/1 on either hand     ->  repeated `step` actions with a hand target moving along
@@ -21,8 +23,9 @@ The task's world is stepped: physics advances only while an action runs. The
 simulator records every physics step in its state directory, and that record
 is what the task's verifier replays.
 
-Written against, and run only with, `g1-dining-salt-mill`. The limits and state
-fields below are that task's; another task works only if its simulator offers
+Written against `g1-dining-salt-mill`, and run with tasks whose simulators offer
+the same controls and robot state (`dining-loaded-tray`). The limits and state
+fields below are those tasks'; another task works only if its simulator offers
 the same controls.
 """
 
@@ -78,11 +81,13 @@ MAX_GAP_M = 0.10
 # slow), or a gap that changes less than GAP_STILL_M per step, for SETTLE_S within SETTLE_LIMIT_S.
 SETTLE_S, SETTLE_STEP_S, SETTLE_LIMIT_S = 0.2, 0.05, 4.0
 GAP_STILL_M = 0.0002
-# The arms and right fingers count as at rest when they move less than this per settle step.
+# The arms and right fingers count as at rest when they move less than this per settle step. The arm's default
+# suits g1-dining-salt-mill's stiff arms; softer arms holding a load tremble more (the arm_still_m option).
 TOOL_STILL_M, FINGER_STILL_RAD = 0.0005, 0.002
 # A pose goal sends the moving hand target this often; the task's own scripted moves use 0.1 s steps.
 POSE_STEP_S = 0.1
 SIDES = ("left", "right")
+ARMS = tuple(f"{side}_arm" for side in SIDES)
 ARM_JOINTS = {
     side: [
         f"{side}_{part}_joint"
@@ -188,8 +193,19 @@ TRACKING = {
     "tracking_window_s": 0.75,
 }
 ZERO_VELOCITY = {"forward_m_s": 0.0, "left_m_s": 0.0, "yaw_rate_rad_s": 0.0}
+FOLLOW_NOTE = (
+    "; while it walks, both hand targets move and turn with the measured base, so the hands keep their pose "
+    "relative to it, as when carrying something in both hands, and the goal ends once the arms are at rest too"
+)
 # Passed through to the simulator when set: the task's own settings, and what its libraries need.
 SIMULATOR_ENV = ("SCENE_SEED", "POSE_JITTER", "RENDER_BACKEND", "MUJOCO_GL", "PATH", "TMPDIR")
+# Runs the entry point as a script, with its own directory first on the import path. In the task's container that
+# directory is /opt/simulator, and an entry point may put that path, not its own, on the import path (isolated mode
+# leaves the script's directory off it); here the simulator sits in the downloaded task instead.
+ENTRY_POINT = (
+    "import os, runpy, sys; entry = sys.argv[1]; sys.argv = [entry]; "
+    "sys.path.insert(0, os.path.dirname(entry)); runpy.run_path(entry, run_name='__main__')"
+)
 
 
 def robots(
@@ -198,6 +214,8 @@ def robots(
     state_dir: str | None = None,
     url: str | None = None,
     name: str | None = None,
+    hands_follow_base: str = "false",
+    arm_still_m: str = str(TOOL_STILL_M),
 ) -> dict[str, Backend]:
     """The robot `--backend task` serves.
 
@@ -208,13 +226,30 @@ def robots(
 
     To attach to a simulator that is already running, such as the task's own simulator container: `url`, where
     it listens, and `name`, the task's name. That simulator records the episode in its own state directory.
+
+    `hands_follow_base=true`: a base goal also carries both hand targets with the measured base, so the hands keep
+    their pose relative to it while it walks, as when carrying something in both hands. Otherwise they stay where
+    they are in the world.
+
+    `arm_still_m`: how far a hand's tool site may move in one 0.05 s step while its arm counts as at rest, which
+    confirms that a stopped arm holds still. Arms whose controller trembles under a load need more than the
+    default, or no stop of a loaded arm is ever confirmed.
     """
+    if hands_follow_base not in ("true", "false"):
+        raise StartupError(f"hands_follow_base is true or false, not {hands_follow_base!r}")
+    try:
+        still = float(arm_still_m)
+    except ValueError:
+        still = math.nan
+    if not 0 < still < 0.05:
+        raise StartupError(f"arm_still_m is a distance in metres between 0 and 0.05, not {arm_still_m!r}")
+    options = {"hands_follow_base": hands_follow_base == "true", "arm_still_m": still}
     if url is not None:
         if task_dir or python or state_dir or not name:
             raise StartupError(
                 "give url and name to attach to a running simulator, or task_dir, python and state_dir to start one"
             )
-        task = TaskBackend(name, url.rstrip("/"), epoch=url.rstrip("/"))
+        task = TaskBackend(name, url.rstrip("/"), epoch=url.rstrip("/"), **options)
         return {f"task-{task.name}": task}
     if not (task_dir and python and state_dir) or name:
         raise StartupError(
@@ -228,6 +263,7 @@ def robots(
         epoch=str(state_path),
         state_dir=state_path,
         simulator=_start_simulator(task_path, python_path, state_path),
+        **options,
     )
     return {f"task-{task.name}": task}
 
@@ -255,7 +291,7 @@ def _start_simulator(task_dir: Path, python: Path, state_dir: Path) -> Iterator[
     with (
         open(state_dir / "simulator.log", "w") as output,
         subprocess.Popen(
-            [str(python), "-I", "-B", str(entry)],
+            [str(python), "-I", "-B", "-c", ENTRY_POINT, str(entry)],
             cwd=state_dir,
             env={**settings, "STATE_DIR": str(state_dir), "SIM_PORT": str(port)},
             stdout=output,
@@ -293,9 +329,14 @@ class TaskBackend(Backend):
         epoch: str,
         state_dir: Path | None = None,
         simulator: AbstractContextManager[tuple[subprocess.Popen[bytes], str]] | None = None,
+        hands_follow_base: bool = False,
+        arm_still_m: float = TOOL_STILL_M,
     ):
         """Start the owned simulator or attach to the given URL."""
         self.name = name
+        self._arm_still_m = arm_still_m
+        self._follows = hands_follow_base  # a base goal then also commands both arms (see robots())
+        self._base_resources = ["base", *ARMS] if hands_follow_base else ["base"]
         self._epoch = epoch  # names this episode on the task_sim clock
         self._state_dir = state_dir
         self._process: subprocess.Popen[bytes] | None = None
@@ -469,11 +510,12 @@ class TaskBackend(Backend):
                     profile="base.planar_velocity/1",
                     target="base",
                     role="mobile_base",
-                    resources=["base"],
+                    resources=list(self._base_resources),
                     controller="task locomotion policy",
                     assistance=(
                         "the task's learned walking policy keeps balance and follows the velocity loosely; travel is "
                         "verified against base velocity measured over one gait cycle, so a blocked base fails"
+                        + (FOLLOW_NOTE if self._follows else "")
                     ),
                     stop_deadline_wall_s=15.0,
                     limits=BaseVelocityLimits(
@@ -537,8 +579,12 @@ class TaskBackend(Backend):
                         controller="task arm controller",
                         assistance=(
                             "the task's whole-arm inverse kinematics follows the moving hand target and avoids "
-                            "self-collision; it does not plan around the scene, and the hand target stays fixed in "
-                            "the world when the base walks"
+                            "self-collision; it does not plan around the scene, and the hand target "
+                            + (
+                                "moves with the base when it walks"
+                                if self._follows
+                                else "stays fixed in the world when the base walks"
+                            )
                         ),
                         stop_deadline_wall_s=15.0,
                         limits=ToolPoseLimits(**POSE_LIMITS, control_point=f"{side}_tool"),
@@ -842,16 +888,23 @@ class TaskBackend(Backend):
                 self._activities[activity_id] = status
 
     def _travel(self, activity_id: str, judge: VelocityJudge) -> None:
-        """Timed travel as equal `step` actions, then steps at rest. The judge decides from the measured poses."""
+        """Timed travel as equal `step` actions, then steps at rest. The judge decides from the measured poses.
+        With hands_follow_base, every step also sends both hand targets, carried with the base as last measured."""
         action = judge.command
         count = max(1, math.ceil(action.duration_s / STEP_MAX_S))
         seconds = max(STEP_MIN_S, action.duration_s / count)
         command = [action.forward_m_s, action.left_m_s, action.yaw_rate_rad_s]
+        carry = self._carrier() if self._follows else None
         try:
             for _ in range(count):
                 if self._skip(activity_id):
                     return
-                reply = self._act({"action": "step", "seconds": seconds, "base_velocity": command})
+                request: dict[str, Any] = {"action": "step", "seconds": seconds, "base_velocity": command}
+                if carry is not None:
+                    with self._lock:
+                        robot = self._robot
+                    request["hands"] = carry(robot)
+                reply = self._act(request)
                 if reply["robot"]["fallen"]:
                     self._report(activity_id, ActivityStatus("failed", error="robot_fell", detail="the robot fell"))
                     return
@@ -860,19 +913,54 @@ class TaskBackend(Backend):
                     self._report(activity_id, status)
                     return
             self._report(activity_id, ActivityStatus("finishing"))
-            rested, _ = self._rest(["base"], activity_id=activity_id)
+            rested, _ = self._rest(self._base_resources, activity_id=activity_id, carry=carry)
         except _Refused as refusal:
             self._report(activity_id, ActivityStatus("failed", error="task_rejected", detail=str(refusal)))
             return
         with self._lock:
             time_s, pose, stable = self._sim_time, tuple(self._robot["base_xy_yaw"]), self._robot["support"]["stable"]
-            self._settled["base"] = rested >= SETTLE_S
+            for rid in self._base_resources:
+                self._settled[rid] = rested >= SETTLE_S
         status = judge.update(time_s, pose, still_for_s=rested)  # where the base came to rest
         if status.phase != "done":  # no stable stand was measured in the time this adapter steps for
-            detail = "the base did not come to a stable stand after travelling"
+            detail = "the base did not come to a stable stand after travelling" + (
+                ", with both arms at rest" if carry is not None else ""
+            )
             status = ActivityStatus("failed", judge.measurements(), error="base_not_settled", detail=detail)
         status.measurements["stable"] = stable
         self._report(activity_id, status)
+
+    def _carrier(self) -> Callable[[dict[str, Any]], dict[str, Any]]:
+        """Hand targets for a step, from the robot state before it: each hand target where it was when the travel
+        began, moved by the planar motion that takes the base from where it was measured then to where it is
+        measured now. Hand targets, not measured hands, are carried, since a loaded hand sags below its target."""
+        with self._lock:
+            x0, y0, yaw0 = self._robot["base_xy_yaw"]
+            held = {side: self._hand_target[side] for side in SIDES}
+
+        def carry(robot: dict[str, Any]) -> dict[str, Any]:
+            x, y, yaw = robot["base_xy_yaw"]
+            turn = [0.0, 0.0, math.sin((yaw - yaw0) / 2), math.cos((yaw - yaw0) / 2)]
+            targets = {}
+            for side, pose in held.items():
+                px, py, pz = pose["position_m"]
+                dx, dy, _ = _rotate(turn, [px - x0, py - y0, 0.0])
+                targets[side] = {
+                    "frame_id": "world",
+                    "position_m": [x + dx, y + dy, pz],
+                    "orientation_xyzw": _qmul(turn, pose["orientation_xyzw"]),
+                }
+            with self._lock:
+                self._hand_target.update(targets)
+            return {
+                side: {
+                    "position": t["position_m"],
+                    "quaternion": [t["orientation_xyzw"][3], *t["orientation_xyzw"][:3]],
+                }
+                for side, t in targets.items()
+            }
+
+        return carry
 
     def _grip(self, activity_id: str, judge: WidthJudge) -> None:
         """One `grip` action, then steps at rest. The judge decides from the gap measured after each step."""
@@ -1061,6 +1149,7 @@ class TaskBackend(Backend):
         hold_measured: bool = False,
         activity_id: str | None = None,
         until: Callable[[dict[str, Any]], ActivityStatus] | None = None,
+        carry: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
     ) -> tuple[float, ActivityStatus]:
         """Step with zero travel until measurements show these resources at rest and `until`, if given, decides
         "done" from the robot state after a step; give up after SETTLE_LIMIT_S. Returns how long the resources
@@ -1070,6 +1159,7 @@ class TaskBackend(Backend):
         The jaws are never set wider than they were asked to be: jaws stopped on an object keep squeezing it,
         since a position-controlled gripper held at its measured gap presses with no force and drops what it holds.
         The base is at rest when the task reports a stable stand; a gripper, hand or arm when it stops moving.
+        carry: hand targets for each step from the robot state before it, for arms carried with the base.
         """
         with self._lock:
             before = self._robot
@@ -1094,9 +1184,11 @@ class TaskBackend(Backend):
         while (at_rest_for < SETTLE_S or (until is not None and status.phase != "done")) and waited < SETTLE_LIMIT_S:
             if activity_id is not None and self._skip(activity_id):
                 raise _Cancelled
+            if carry is not None:
+                request["hands"] = carry(before)
             robot = self._act(request)["robot"]
             waited += SETTLE_STEP_S
-            resting = _at_rest(resources, before, robot)
+            resting = _at_rest(resources, before, robot, self._arm_still_m)
             before = robot
             at_rest_for = at_rest_for + SETTLE_STEP_S if resting else 0.0
             if until is not None:
@@ -1104,14 +1196,14 @@ class TaskBackend(Backend):
         return at_rest_for, status
 
 
-def _at_rest(resources: Sequence[str], before: dict[str, Any], after: dict[str, Any]) -> bool:
+def _at_rest(resources: Sequence[str], before: dict[str, Any], after: dict[str, Any], arm_still_m: float) -> bool:
     """Whether each resource was still over one settle step, measured from the robot state before and after."""
     hb, ha = before["hands"], after["hands"]
     checks = {
         "base": lambda: after["support"]["stable"],
         "left_gripper": lambda: abs(ha["left"]["gap_m"] - hb["left"]["gap_m"]) < GAP_STILL_M,
-        "left_arm": lambda: math.dist(ha["left"]["position"], hb["left"]["position"]) < TOOL_STILL_M,
-        "right_arm": lambda: math.dist(ha["right"]["position"], hb["right"]["position"]) < TOOL_STILL_M,
+        "left_arm": lambda: math.dist(ha["left"]["position"], hb["left"]["position"]) < arm_still_m,
+        "right_arm": lambda: math.dist(ha["right"]["position"], hb["right"]["position"]) < arm_still_m,
         "right_hand": lambda: (
             max(
                 abs(angle - hb["right"]["finger_joint_angles"][name])

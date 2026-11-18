@@ -33,6 +33,7 @@ from pydantic import Field, ValidationError
 from homunculus import journal, rigs, server
 from homunculus.backends.fake import FakeBackend
 from homunculus.backends.task import TaskBackend, _start_simulator
+from homunculus.backends.task import robots as task_robots
 from homunculus.cli import main as cli_main
 from homunculus.client import ClientError, RobotClient, Target, TargetStore
 from homunculus.grasp import GripperGraspGoal
@@ -1475,6 +1476,90 @@ def test_a_both_hands_goal_carries_the_right_hand_rigidly_with_the_left(tmp_path
     assert hands["right"]["position"] == pytest.approx([0.8, 0.2, 1.0], abs=1e-9)
     w, x, y, z = hands["right"]["quaternion_wxyz"]
     assert [x, y, z, w] == pytest.approx(quarter_turn, abs=1e-9)
+
+
+def test_a_base_goal_with_hands_following_carries_both_hand_targets_with_the_base(tmp_path, monkeypatch):
+    state = task_state()
+    hands, robot = state["robot"]["hands"], state["robot"]
+    hands["left"] = {**hands["left"], "position": [0.3, 0.2, 0.9]}
+    hands["right"] = {**hands["right"], "position": [0.3, -0.2, 0.9]}
+    carried = []
+
+    def simulator(request):
+        if request.url.path == "/health":
+            return httpx.Response(200, json={"ready": True})
+        if request.method == "POST":
+            body = json.loads(request.content)
+            dt = body.get("seconds", 0.0)
+            forward, left, turn = body.get("base_velocity", [0.0, 0.0, 0.0])
+            x, y, yaw = robot["base_xy_yaw"]  # a base that follows its command exactly
+            yaw += turn * dt
+            robot["base_xy_yaw"] = [
+                x + (math.cos(yaw) * forward - math.sin(yaw) * left) * dt,
+                y + (math.sin(yaw) * forward + math.cos(yaw) * left) * dt,
+                yaw,
+            ]
+            carried.append(sorted(body.get("hands", {})))
+            for side, target in body.get("hands", {}).items():  # arms that track their targets exactly
+                hands[side] = {**hands[side], "position": target["position"], "quaternion_wxyz": target["quaternion"]}
+            state["sim_time"] += dt
+        return httpx.Response(200, json=state)
+
+    client = httpx.Client(transport=httpx.MockTransport(simulator), base_url="http://simulator")
+    monkeypatch.setattr(httpx, "Client", lambda **_: client)
+    backend = lambda _: TaskBackend("test", "http://simulator", epoch="test", hands_follow_base=True)  # noqa: E731
+    with Harness(tmp_path / "journal.sqlite", "task", backend=backend) as task:
+        task.open()
+        (binding,) = [b for b in task.backend.describe().bindings if b.profile == "base.planar_velocity/1"]
+        assert binding.resources == ["base", "left_arm", "right_arm"]
+        action = BaseVelocityGoal(
+            profile="base.planar_velocity/1",
+            target="base",
+            forward_m_s=0.2,
+            left_m_s=0.0,
+            yaw_rate_rad_s=math.pi / 8,
+            duration_s=4.0,
+        )
+        goal = task.submit(action)
+        deadline = time.monotonic() + 10
+        while (goal := task.runtime.goal(goal.goal_id)).state not in ("succeeded", "failed", "cancelled"):
+            assert time.monotonic() < deadline
+            task.run(STEP)
+            time.sleep(0.002)
+    assert goal.state == "succeeded", goal
+    assert carried and all(sides == ["left", "right"] for sides in carried)
+    # The base turned a quarter turn; each hand kept its place and heading relative to it.
+    x, y, yaw = robot["base_xy_yaw"]
+    assert yaw == pytest.approx(math.pi / 2, abs=1e-9)
+    for side, (ahead, beside) in (("left", (0.3, 0.2)), ("right", (0.3, -0.2))):
+        position = hands[side]["position"]
+        assert position == pytest.approx([x - beside, y + ahead, 0.9], abs=1e-9)
+        w, qx, qy, qz = hands[side]["quaternion_wxyz"]
+        assert [qx, qy, qz, w] == pytest.approx([0.0, 0.0, math.sin(math.pi / 4), math.cos(math.pi / 4)], abs=1e-9)
+
+
+def test_a_task_option_out_of_range_is_refused_before_anything_starts():
+    with pytest.raises(StartupError, match="hands_follow_base is true or false"):
+        task_robots(url="http://simulator", name="test", hands_follow_base="yes")
+    with pytest.raises(StartupError, match="arm_still_m is a distance"):
+        task_robots(url="http://simulator", name="test", arm_still_m="0.5")
+
+
+def test_a_simulator_entry_point_imports_its_neighbours_whatever_path_it_names(tmp_path):
+    root = tmp_path / "task"
+    entry = root / "environment" / "simulator" / "start.py"
+    entry.parent.mkdir(parents=True)
+    # As in a task container whose simulator lives in /opt/simulator: the entry point names that path, not its own.
+    entry.write_text("import sys\nsys.path.insert(0, '/opt/simulator')\nimport neighbour\n")
+    (entry.parent / "neighbour.py").write_text(
+        "import os, pathlib, time\npathlib.Path(os.environ['STATE_DIR'], 'imported').touch()\ntime.sleep(60)\n"
+    )
+    with _start_simulator(root, Path(sys.executable), tmp_path / "episode") as (process, _):
+        deadline = time.monotonic() + 10
+        while not (tmp_path / "episode" / "imported").exists():
+            assert process.poll() is None, (tmp_path / "episode" / "simulator.log").read_text()
+            assert time.monotonic() < deadline
+            time.sleep(0.05)
 
 
 def test_jaws_stopped_on_an_object_keep_squeezing_when_the_goal_ends(tmp_path, monkeypatch):
