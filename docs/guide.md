@@ -648,9 +648,11 @@ What the adapter maps, and what it does not:
   `closed`, so that goal fails with `posture_not_reached` and the contact
   force; that is how a grasp shows.
 - The four robot cameras, the base, arm, gripper, and hand state, and the
-  task's remaining budgets as observations. Object poses are not exposed, as
+  task's remaining budgets as observations, where its simulator reports them
+  (`office-paper-injection`'s reports none). Object poses are not exposed, as
   in the task's own interface. The cameras take snapshots only: each capture
-  uses the task's budget of 300, so they offer no live video.
+  uses one of the task's limited captures (300 on `g1-dining-salt-mill`), so
+  they offer no live video.
 - Not mapped: the task's planned `reach`, `move_hand` (a pose goal does the
   same motion through `step`, and is measured on the way), `walk_to`, and
   `wait`. Goals run one at a time, although the task could move several parts

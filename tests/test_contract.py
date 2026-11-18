@@ -1374,6 +1374,32 @@ def task_state(*, finished=False):
     }
 
 
+@pytest.mark.parametrize("budget", [None, 300])
+def test_a_task_capture_spends_a_budget_only_where_the_simulator_states_one(monkeypatch, budget):
+    """g1-dining-salt-mill states its remaining captures in /state; office-paper-injection states none."""
+
+    def simulator(request):
+        if request.url.path == "/health":
+            return httpx.Response(200, json={"ready": True})
+        if request.url.path == "/observe":
+            lens = {"width": 4, "height": 3, "focal_px": 2.0, "camera_position": [0.0, 0.0, 1.0], "sim_time": 0.0}
+            metadata = {**lens, "world_from_camera": [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]}
+            return httpx.Response(200, json={"metadata": metadata, "rgb_png": "cG5n", "depth_npy": "bnB5"})
+        state = task_state()
+        if budget is not None:
+            state["observations_remaining"] = budget
+        return httpx.Response(200, json=state)
+
+    client = httpx.Client(transport=httpx.MockTransport(simulator), base_url="http://simulator")
+    monkeypatch.setattr(httpx, "Client", lambda **_: client)
+    with TaskBackend("test", "http://simulator", epoch="test") as task:
+        head = next(sensor for sensor in task.describe().sensors if sensor.id == "head")
+        assert ("budget of 300" in head.description) == (budget is not None)
+        assert [frame.image.kind for frame in task.capture("head")] == ["rgb", "depth"]
+        remaining = task.advance().samples["task"].values.get("observations_remaining")
+        assert remaining == (None if budget is None else budget - 1)
+
+
 @pytest.mark.parametrize("wait_in_queue", [False, True])
 def test_a_pending_episode_finish_leaves_stops_responsive(tmp_path, monkeypatch, wait_in_queue):
     entered, release, sent = threading.Event(), threading.Event(), threading.Event()

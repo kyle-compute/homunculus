@@ -25,9 +25,9 @@ simulator records every physics step in its state directory, and that record
 is what the task's verifier replays.
 
 Written against `g1-dining-salt-mill`, and run with tasks whose simulators offer
-the same controls and robot state (`dining-loaded-tray`). The limits and state
-fields below are those tasks'; another task works only if its simulator offers
-the same controls.
+the same controls and robot state (`dining-loaded-tray`, `office-paper-injection`,
+whose simulator states no budgets). The limits and state fields below are those
+tasks'; another task works only if its simulator offers the same controls.
 """
 
 from __future__ import annotations
@@ -372,6 +372,8 @@ class TaskBackend(Backend):
         try:
             self._wait_until_ready()
             self._record(self._http.get("/state").raise_for_status().json())
+            # The capture budget, when the simulator states one (in /state, as g1-dining-salt-mill does).
+            self._captures: int | None = self._task.get("observations_remaining")
             self._revisions = {"task": self.name, "simulator": url}
             if self._state_dir is not None:
                 self._revisions["scene_seed"] = str(json.loads((self._state_dir / "seed.json").read_text())["seed"])
@@ -485,7 +487,12 @@ class TaskBackend(Backend):
                         id=camera,
                         kind="camera",
                         provenance="simulation_ground_truth",
-                        description="rendered 960x720 RGB and metric depth; each capture uses the task's budget of 300",
+                        description="rendered 960x720 RGB and metric depth"
+                        + (
+                            f"; each capture uses the task's budget of {self._captures}"
+                            if self._captures is not None
+                            else ""
+                        ),
                     )
                     for camera in CAMERAS
                 ),
@@ -759,8 +766,9 @@ class TaskBackend(Backend):
             raise RobotError("backend_error", f"the task simulator did not answer the capture: {error}") from error
         if response.status_code != 200:
             raise RobotError("backend_error", f"the task simulator refused the capture: {body.get('error')}")
-        with self._lock:  # the simulator states this count only in /state; each capture spends one
-            self._task["observations_remaining"] -= 1
+        with self._lock:  # a simulator that counts captures states the count only in /state; each capture spends one
+            if "observations_remaining" in self._task:
+                self._task["observations_remaining"] -= 1
         rgb, depth = _camera_image(body["metadata"], self._epoch), base64.b64decode(body["depth_npy"])
         return [
             Frame(rgb, base64.b64decode(body["rgb_png"])),
