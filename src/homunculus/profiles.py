@@ -11,6 +11,10 @@ profile. A backend commands its robot and feeds the judge what it measured;
 the judge applies the binding's tolerances and settle times and returns the
 ActivityStatus the backend reports. Every backend therefore succeeds and fails
 by the same rules, with the same measurements.
+
+Each profile is one `Profile` in `PROFILES`: its request and limits models, its
+admission rule, and its judge. A new kind of motion is a new `Profile` passed to
+`register()`; the runtime, the service and the client look profiles up there.
 """
 
 from __future__ import annotations
@@ -18,12 +22,13 @@ from __future__ import annotations
 import bisect
 import itertools
 import math
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
-from typing import Any, Literal
+from functools import wraps
+from threading import Lock
+from typing import Any, Concatenate, Literal, get_args
 
 from .models import (
-    Action,
     BaseVelocityGoal,
     BaseVelocityLimits,
     BaseVelocityTarget,
@@ -34,6 +39,7 @@ from .models import (
     JointLimit,
     JointTrajectoryGoal,
     JointTrajectoryLimits,
+    Model,
     ProfileBinding,
     RobotError,
     StreamSpec,
@@ -73,49 +79,45 @@ def find_binding(bindings: Iterable[ProfileBinding], profile: str, target: str, 
     )
 
 
-def resolve_action(action: Action, binding: ProfileBinding) -> Action:
-    """Check a finite action against its binding; return it with every setting concrete."""
-    limits = binding.limits
-    if isinstance(action, BaseVelocityGoal):
-        check_velocity(action, limits)
-        _within("duration_s", action.duration_s, 0.0, limits.max_goal_duration_s)
-        _check_verifiable(action, limits)
-        return action
-    if isinstance(action, JointTrajectoryGoal):
-        return _resolve_trajectory(action, limits)
-    if isinstance(action, HandPostureGoal):
-        if action.posture not in limits.postures:
+def _resolve_velocity_goal(action: BaseVelocityGoal, limits: BaseVelocityLimits) -> BaseVelocityGoal:
+    check_velocity(action, limits)
+    _within("duration_s", action.duration_s, 0.0, limits.max_goal_duration_s)
+    _check_verifiable(action, limits)
+    return action
+
+
+def _resolve_posture(action: HandPostureGoal, limits: HandPostureLimits) -> HandPostureGoal:
+    if action.posture not in limits.postures:
+        raise RobotError(
+            "unsupported_parameter",
+            f"posture {action.posture!r} is not advertised for {action.target!r}",
+            parameter="posture",
+            supported=sorted(limits.postures),
+        )
+    return action
+
+
+def _resolve_width(action: GripperWidthGoal, limits: GripperWidthLimits) -> GripperWidthGoal:
+    if action.complete_on not in limits.complete_on:
+        raise RobotError(
+            "unsupported_parameter",
+            f"{action.target!r} has no qualified detector for complete_on={action.complete_on}",
+            parameter="complete_on",
+            supported=limits.complete_on,
+        )
+    for name, rule, advertised in (
+        ("contact_rule", action.contact_rule, limits.contact_rules),
+        ("force_rule", action.force_rule, limits.force_rules),
+    ):
+        if rule is not None and rule not in advertised:
             raise RobotError(
                 "unsupported_parameter",
-                f"posture {action.posture!r} is not advertised for {action.target!r}",
-                parameter="posture",
-                supported=sorted(limits.postures),
+                f"{name} {rule!r} is not an advertised rule for {action.target!r}",
+                parameter=name,
+                supported=advertised,
             )
-        return action
-    if isinstance(action, GripperWidthGoal):
-        if action.complete_on not in limits.complete_on:
-            raise RobotError(
-                "unsupported_parameter",
-                f"{action.target!r} has no qualified detector for complete_on={action.complete_on}",
-                parameter="complete_on",
-                supported=limits.complete_on,
-            )
-        for name, rule, advertised in (
-            ("contact_rule", action.contact_rule, limits.contact_rules),
-            ("force_rule", action.force_rule, limits.force_rules),
-        ):
-            if rule is not None and rule not in advertised:
-                raise RobotError(
-                    "unsupported_parameter",
-                    f"{name} {rule!r} is not an advertised rule for {action.target!r}",
-                    parameter=name,
-                    supported=advertised,
-                )
-        _within("width_m", action.width_m, limits.min_width_m, limits.max_width_m)
-        return action
-    if isinstance(action, ToolPoseGoal):
-        return _resolve_pose(action, limits)
-    raise RobotError("unsupported_profile", f"no resolution rule for {action.profile}", profile=action.profile)
+    _within("width_m", action.width_m, limits.min_width_m, limits.max_width_m)
+    return action
 
 
 QUATERNION_NORM_TOLERANCE = 1e-3
@@ -155,19 +157,6 @@ def _resolve_pose(action: ToolPoseGoal, limits: ToolPoseLimits) -> ToolPoseGoal:
             "orientation_tolerance_rad": orientation_tolerance,
         }
     )
-
-
-def stated_duration_s(action: Action) -> float | None:
-    """How long a request says its own motion takes, in execution time; None when it states no time.
-
-    A trajectory ends at its last waypoint and a timed base goal travels for duration_s. A posture or a gripper
-    width moves at the binding's speed from wherever it starts, which a request does not state.
-    """
-    if isinstance(action, JointTrajectoryGoal):
-        return action.points[-1].time_s
-    if isinstance(action, BaseVelocityGoal):
-        return action.duration_s
-    return None
 
 
 def resolve_stream(spec: StreamSpec, binding: ProfileBinding) -> BaseVelocityLimits:
@@ -428,7 +417,7 @@ def _segment_extrema(p0: float, v0: float, p1: float, v1: float, duration: float
 # --------------------------------------------------------------------------
 
 
-@dataclass
+@dataclass(frozen=True)
 class ActivityStatus:
     """Progress of one goal or stream, as a judge decided it from measurements."""
 
@@ -438,16 +427,47 @@ class ActivityStatus:
     detail: str | None = None
 
 
-class TrajectoryJudge:
+class MotionJudge:
+    """Owns the latest verdict computed from measurements, including readings fed by a backend worker."""
+
+    def __init__(self) -> None:
+        self._status: ActivityStatus | None = None
+        self._lock = Lock()
+
+    @property
+    def status(self) -> ActivityStatus | None:
+        with self._lock:
+            return self._status
+
+
+def measures[J: MotionJudge, **P](
+    update: Callable[Concatenate[J, P], ActivityStatus],
+) -> Callable[Concatenate[J, P], ActivityStatus]:
+    """Decorate a judge's update so its verdict is published as the judge's `status` once computed: a backend
+    that feeds the judge itself, and the runtime, read it there."""
+
+    @wraps(update)
+    def measure(judge: J, /, *args: P.args, **kwargs: P.kwargs) -> ActivityStatus:
+        outcome = update(judge, *args, **kwargs)
+        with judge._lock:
+            judge._status = outcome
+        return outcome
+
+    return measure
+
+
+class TrajectoryJudge(MotionJudge):
     """joints.trajectory/1. The measured path must stay within path_tolerance of the reference. After the last
     waypoint, the goal is met once every joint has been within goal_tolerance and slower than settle_velocity
     for settle_time_s."""
 
     def __init__(self, action: JointTrajectoryGoal, limits: JointTrajectoryLimits):
+        super().__init__()
         self.action, self.limits = action, limits
         self.settled_for = 0.0
         self.peak_error = 0.0
 
+    @measures
     def update(
         self, elapsed: float, positions: Sequence[float], velocities: Sequence[float], dt: float
     ) -> ActivityStatus:
@@ -481,15 +501,17 @@ class TrajectoryJudge:
         return ActivityStatus("done", measurements)
 
 
-class WidthJudge:
+class WidthJudge(MotionJudge):
     """gripper.width/1 with complete_on=width_reached: met once the measured gap has stayed within goal_tolerance_m
     of the request for settle_time_s. Nothing here tells a blocked jaw from a slow one, so a jaw that never gets
     there does not fail here; the goal's deadline ends it."""
 
     def __init__(self, action: GripperWidthGoal, limits: GripperWidthLimits):
+        super().__init__()
         self.action, self.limits = action, limits
         self.within_for = 0.0
 
+    @measures
     def update(self, width_m: float, dt: float) -> ActivityStatus:
         error = abs(width_m - self.action.width_m)
         if error > self.limits.goal_tolerance_m:
@@ -501,14 +523,16 @@ class WidthJudge:
         return ActivityStatus("done", {"width_m": width_m, "error_m": error})
 
 
-class PostureJudge:
+class PostureJudge(MotionJudge):
     """hand.posture/1: met once every joint the posture names has stayed within goal_tolerance_rad of it for
     settle_time_s. As with a gripper, a hand that never gets there is ended by the goal's deadline."""
 
     def __init__(self, action: HandPostureGoal, limits: HandPostureLimits):
+        super().__init__()
         self.action, self.limits = action, limits
         self.within_for = 0.0
 
+    @measures
     def update(self, positions: Mapping[str, float], dt: float) -> ActivityStatus:
         targets = self.limits.postures[self.action.posture]
         error = max(abs(positions[name] - angle) for name, angle in targets.items())
@@ -521,7 +545,7 @@ class PostureJudge:
         return ActivityStatus("done", {"posture": self.action.posture, "max_error_rad": error})
 
 
-class PoseJudge:
+class PoseJudge(MotionJudge):
     """tool.pose.linear/1. The reference moves the tool origin along the straight segment from where it was
     measured at activation to the goal, and turns it along the shortest rotation, both on a smoothstep
     (zero speed at both ends). It lasts long enough that neither the peak speed nor the peak rotation rate
@@ -535,6 +559,7 @@ class PoseJudge:
     def __init__(
         self, action: ToolPoseGoal, limits: ToolPoseLimits, start_m: Sequence[float], start_xyzw: Sequence[float]
     ):
+        super().__init__()
         self.action, self.limits = action, limits
         self.start_m, self.start_xyzw = list(start_m), _same_hemisphere(start_xyzw, action.orientation_xyzw)
         distance = math.dist(self.start_m, action.position_m)
@@ -551,6 +576,7 @@ class PoseJudge:
         position = [a + s * (b - a) for a, b in zip(self.start_m, self.action.position_m, strict=True)]
         return position, _slerp(self.start_xyzw, self.action.orientation_xyzw, s)
 
+    @measures
     def update(self, elapsed: float, position_m: Sequence[float], xyzw: Sequence[float], dt: float) -> ActivityStatus:
         action, limits = self.action, self.limits
         position_error = math.dist(position_m, action.position_m)
@@ -624,7 +650,7 @@ def _distance_to_segment(p: Sequence[float], a: Sequence[float], b: Sequence[flo
 Pose = tuple[float, float, float]  # x_m, y_m, yaw_rad in the world frame
 
 
-class VelocityJudge:
+class VelocityJudge(MotionJudge):
     """base.planar_velocity/1, as a timed goal or as a stream.
 
     Velocity is measured from successive base poses, averaged over tracking_window_s. From transient_s after
@@ -642,6 +668,7 @@ class VelocityJudge:
         pose: Pose,
         duration_s: float | None = None,
     ):
+        super().__init__()
         self.command = command  # a stream replaces this with each new target
         self.limits = limits
         self.duration_s = duration_s  # None for a stream, which travels until it ends
@@ -656,6 +683,7 @@ class VelocityJudge:
         self.off_track_for = 0.0
         self.tracked = not any(self._commanded())  # standing still is met by a base that stays still
 
+    @measures
     def update(self, time_s: float, pose: Pose, still_for_s: float) -> ActivityStatus:
         """Judge the pose measured at `time_s`. `still_for_s` is how long the backend has measured the base at
         rest, up to now: the same standstill it reports when confirming a stop."""
@@ -735,3 +763,130 @@ def _mean_velocity(poses: Sequence[tuple[float, float, float, float]], window_s:
         (dy * math.cos(heading) - dx * math.sin(heading)) / seconds,
         turn / seconds,
     )
+
+
+# --------------------------------------------------------------------------
+# The profiles: each one whole, looked up by name
+# --------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class Reading:
+    """One measurement of a goal's first resource, as the runtime hands it to the goal's profile."""
+
+    values: Mapping[str, Any]  # the resource's Sample.values
+    time_s: float  # execution time of the measurement
+    elapsed_s: float = 0.0  # since the goal was activated
+    dt_s: float = 0.0  # since the previous reading
+    still_for_s: float = 0.0  # how long the backend has measured the resource at rest under the fallback
+
+
+@dataclass(frozen=True)
+class Profile[A: Model, L: Model, J: MotionJudge]:
+    """One kind of motion, whole: the request it accepts, the limits a binding declares for it, how a request is
+    admitted, and how its success is judged. Pass one to register() to add a profile; the runtime, the service,
+    the client and `homunculus goal submit` look it up by name and need no other change."""
+
+    name: str
+    action: type[A]  # the request; its `profile` field is Literal[name]
+    limits: type[L]  # what a binding declares; its `profile` field is Literal[name]
+    resolve: Callable[[A, L], A]  # refuse what the limits do not allow; return the request with every setting concrete
+    judge: Callable[[A, L, Reading], J]  # a judge for one activation, from the measurement at activation
+    # Feed the judge one newer measurement. A backend that reports goal samples at its own cadence calls the
+    # judge's update itself instead.
+    measure: Callable[[J, Reading], ActivityStatus]
+    activate: Callable[[A, L, Reading], A] = lambda action, limits, reading: action  # bind the request to the start
+    duration_s: Callable[[A], float | None] = lambda action: None  # how long the request says its motion takes
+
+
+PROFILES: dict[str, Profile[Any, Any, Any]] = {}
+
+
+def register(profile: Profile[Any, Any, Any]) -> Profile[Any, Any, Any]:
+    """Add a profile. Its name is what requests and bindings carry, so both models must say it, and no other
+    profile may already use it."""
+    for model in (profile.action, profile.limits):
+        if get_args(model.model_fields["profile"].annotation) != (profile.name,):
+            raise ValueError(f"{model.__name__}.profile must be Literal[{profile.name!r}]")
+    if profile.name in PROFILES:
+        raise ValueError(f"a profile named {profile.name!r} is already registered")
+    PROFILES[profile.name] = profile
+    return profile
+
+
+def _measure_trajectory(judge: TrajectoryJudge, reading: Reading) -> ActivityStatus:
+    joints = judge.action.joints
+    positions = [reading.values["positions"][name] for name in joints]
+    velocities = [reading.values["velocities"][name] for name in joints]
+    return judge.update(reading.elapsed_s, positions, velocities, reading.dt_s)
+
+
+def _base_pose(reading: Reading) -> Pose:
+    positions = reading.values["positions"]
+    return positions["x_m"], positions["y_m"], positions["yaw_rad"]
+
+
+register(
+    Profile(
+        name="joints.trajectory/1",
+        action=JointTrajectoryGoal,
+        limits=JointTrajectoryLimits,
+        resolve=_resolve_trajectory,
+        activate=lambda action, limits, reading: activate_trajectory(
+            action, limits, reading.values["positions"], reading.values["velocities"]
+        ),
+        duration_s=lambda action: action.points[-1].time_s,
+        judge=lambda action, limits, reading: TrajectoryJudge(action, limits),
+        measure=_measure_trajectory,
+    )
+)
+register(
+    Profile(
+        name="gripper.width/1",
+        action=GripperWidthGoal,
+        limits=GripperWidthLimits,
+        resolve=_resolve_width,
+        judge=lambda action, limits, reading: WidthJudge(action, limits),
+        measure=lambda judge, reading: judge.update(reading.values["width_m"], reading.dt_s),
+    )
+)
+register(
+    Profile(
+        name="hand.posture/1",
+        action=HandPostureGoal,
+        limits=HandPostureLimits,
+        resolve=_resolve_posture,
+        judge=lambda action, limits, reading: PostureJudge(action, limits),
+        measure=lambda judge, reading: judge.update(reading.values["positions"], reading.dt_s),
+    )
+)
+register(
+    Profile(
+        name="tool.pose.linear/1",
+        action=ToolPoseGoal,
+        limits=ToolPoseLimits,
+        resolve=_resolve_pose,
+        judge=lambda action, limits, reading: PoseJudge(
+            action, limits, reading.values["tool"]["position_m"], reading.values["tool"]["orientation_xyzw"]
+        ),
+        measure=lambda judge, reading: judge.update(
+            reading.elapsed_s,
+            reading.values["tool"]["position_m"],
+            reading.values["tool"]["orientation_xyzw"],
+            reading.dt_s,
+        ),
+    )
+)
+register(
+    Profile(
+        name="base.planar_velocity/1",
+        action=BaseVelocityGoal,
+        limits=BaseVelocityLimits,
+        resolve=_resolve_velocity_goal,
+        duration_s=lambda action: action.duration_s,
+        judge=lambda action, limits, reading: VelocityJudge(
+            action, limits, reading.time_s, _base_pose(reading), action.duration_s
+        ),
+        measure=lambda judge, reading: judge.update(reading.time_s, _base_pose(reading), reading.still_for_s),
+    )
+)

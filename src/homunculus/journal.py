@@ -12,16 +12,23 @@ that is already open is refused.
 
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import json
+import logging
+import os
 import sqlite3
 import threading
-from contextlib import closing
-from dataclasses import dataclass
+from collections.abc import Iterator
+from concurrent.futures import Future, ThreadPoolExecutor
+from contextlib import closing, contextmanager
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Self
 
 from .models import RobotError
+
+log = logging.getLogger(__name__)
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS requests (
@@ -70,7 +77,7 @@ class JournalInUse(Exception):
 
 
 class Journal:
-    """One SQLite file, held exclusively. Each write commits, and is on disk, before the call returns."""
+    """One SQLite file, held exclusively. A completed write is durable."""
 
     def __init__(self, path: str | Path, boot_id: str, quota: int = 10_000):
         self.boot_id = boot_id
@@ -97,6 +104,9 @@ class Journal:
             if error.sqlite_errorcode == sqlite3.SQLITE_BUSY:
                 raise JournalInUse(str(path)) from None
             raise OSError(f"cannot use the journal {path}: {error}") from None  # not a database, or damaged
+        self._writer = ThreadPoolExecutor(max_workers=1, thread_name_prefix="journal")
+        self._outcome_lock = threading.Lock()
+        self._outcomes: dict[tuple[str, str], dict[str, Any]] = {}
 
     def lookup(self, principal: str, robot_id: str, request_id: str) -> Entry | None:
         return self._one("principal = ? AND robot_id = ? AND request_id = ?", (principal, robot_id, request_id))
@@ -131,6 +141,8 @@ class Journal:
         rejection already prevents those requests from executing again. Identities
         in the active context are never deleted to make room.
         """
+        # A context may have retired while its terminal writes are still queued. Apply them before counting quota.
+        self.flush()
         with self._lock:
             count = "SELECT COUNT(*) FROM requests WHERE robot_id = ?"
             if self._db.execute(count, (robot_id,)).fetchone()[0] >= self.quota:
@@ -169,7 +181,37 @@ class Journal:
                 (json.dumps(document), int(finished), robot_id, operation_id),
             )
 
+    def record_later(
+        self, robot_id: str, operation_id: str, document: dict[str, Any], *, finished: bool
+    ) -> Future[None]:
+        """Write in order without waiting for disk. Terminal results are readable as soon as queued."""
+        if finished:
+            with self._outcome_lock:
+                self._outcomes[robot_id, operation_id] = document
+        return self._writer.submit(self._save, robot_id, operation_id, document, finished)
+
+    def outcome(self, robot_id: str, operation_id: str) -> dict[str, Any] | None:
+        with self._outcome_lock:
+            return self._outcomes.get((robot_id, operation_id))
+
+    def _save(self, robot_id: str, operation_id: str, document: dict[str, Any], finished: bool) -> None:
+        try:
+            self.record(robot_id, operation_id, document, finished=finished)
+        except Exception:
+            log.exception("could not save %s for robot %s in the request journal", operation_id, robot_id)
+            raise
+        if finished:
+            with self._outcome_lock:
+                key = (robot_id, operation_id)
+                if self._outcomes.get(key) is document:
+                    del self._outcomes[key]
+
+    def flush(self) -> None:
+        """Wait for writes already queued."""
+        self._writer.submit(lambda: None).result()
+
     def close(self) -> None:
+        self._writer.shutdown()
         with self._lock:
             self._db.close()
 
@@ -182,7 +224,54 @@ class Journal:
     def _one(self, where: str, values: tuple[str, ...]) -> Entry | None:
         with self._lock:
             row = self._db.execute(f"SELECT {_COLUMNS} FROM requests WHERE {where}", values).fetchone()
-        return None if row is None else _entry(row)
+            if row is None:
+                return None
+            entry = _entry(row)
+            outcome = self.outcome(entry.robot_id, entry.operation_id)
+            if outcome is not None:
+                return replace(entry, document=outcome, finished=True)
+            return entry
+
+
+@contextmanager
+def lock_directory(directory: Path) -> Iterator[None]:
+    """Hold a directory, made if need be, for one process at a time. The hold ends here or with the process."""
+    while True:
+        directory.mkdir(parents=True, exist_ok=True)
+        try:
+            descriptor = os.open(directory, os.O_RDONLY)
+        except FileNotFoundError:
+            continue  # removed again by the command that held it
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX)
+            # While this waited, the holder may have removed the directory and another command made it
+            # again. What is held here is then not the directory that the others take.
+            try:
+                current = os.stat(directory).st_ino
+            except FileNotFoundError:
+                continue
+            if current == os.fstat(descriptor).st_ino:
+                yield
+                return
+        finally:
+            os.close(descriptor)
+
+
+@dataclass(frozen=True)
+class DemoStart:
+    boot_id: str
+    pid: int
+
+    @classmethod
+    def read(cls, home: Path) -> Self | None:
+        try:
+            stored = json.loads((home / "start.json").read_text())
+            boot_id, pid = stored["boot_id"], stored["pid"]
+        except OSError, ValueError, KeyError, TypeError:
+            return None
+        if isinstance(boot_id, str) and isinstance(pid, int) and pid > 1:
+            return cls(boot_id=boot_id, pid=pid)
+        return None
 
 
 def held(path: str | Path) -> bool:

@@ -21,10 +21,13 @@ import secrets
 import threading
 import time
 from abc import ABC, abstractmethod
-from collections import OrderedDict
+from collections import OrderedDict, deque
 from collections.abc import Iterable, Sequence
+from concurrent.futures import Future
 from dataclasses import dataclass, field
-from typing import Any, Literal, Protocol, Self
+from typing import Any, ClassVar, Literal, NoReturn, Protocol, Self
+
+from pydantic import ConfigDict, Field
 
 from .history import History
 from .journal import Entry, Journal, digest
@@ -45,7 +48,6 @@ from .models import (
     GoalSpec,
     GoalSubmit,
     ImageHandle,
-    JointTrajectoryGoal,
     ManagementRequest,
     Observation,
     Operation,
@@ -71,13 +73,13 @@ from .models import (
     Validation,
 )
 from .profiles import (
+    PROFILES,
     ActivityStatus,
-    activate_trajectory,
+    MotionJudge,
+    Reading,
     check_velocity,
     find_binding,
-    resolve_action,
     resolve_stream,
-    stated_duration_s,
 )
 
 log = logging.getLogger(__name__)
@@ -169,6 +171,13 @@ class StartupError(Exception):
     """A robot or service cannot be served as configured. The message says why, for the person who started it."""
 
 
+class GoalCommand(Contract):
+    """The resolved contract and the runtime's evaluator for this invocation."""
+
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+    judge: MotionJudge = Field(exclude=True, repr=False)
+
+
 class Backend(ABC):
     """What the runtime needs from a robot or simulator. Subclass it to add your own.
 
@@ -178,10 +187,11 @@ class Backend(ABC):
     advertises more than it implements.
 
     Every method except capture() is called only from the control thread, inside tick(), and must return
-    promptly; a backend that does blocking I/O owns its own worker. Samples are stamped on the clock that
-    execution_time_s reads. Success is not the backend's to decide: it reports what the judges in profiles.py
-    decide from its measurements.
+    promptly. Backends reporting readings at physics or device cadence feed the runtime-owned
+    judge on the command they receive. Other backends are judged on fresh samples from advance().
     """
+
+    reports_goal_samples: ClassVar[bool] = False
 
     @abstractmethod
     def describe(self) -> BackendFacts:
@@ -203,8 +213,8 @@ class Backend(ABC):
         """Set a stream's newest setpoint; no stop between updates."""
         raise NotImplementedError(f"{type(self).__name__} advertises a stream but does not implement track()")
 
-    def manage(self, operation: str, parameters: dict[str, Any]) -> dict[str, Any]:
-        """Perform an advertised management operation. May block briefly."""
+    def manage(self, operation: str, parameters: dict[str, Any]) -> dict[str, Any] | Future[dict[str, Any]]:
+        """Perform an advertised management operation, or return its pending result without blocking."""
         raise NotImplementedError(f"{type(self).__name__} advertises {operation} but does not implement manage()")
 
     def capture(self, sensor: str) -> list[Frame]:
@@ -262,11 +272,20 @@ class _Ending:
 
 
 @dataclass
+class _GoalEvaluation:
+    judge: MotionJudge
+    started_s: float
+    last_sample_s: float
+
+
+@dataclass
 class _GoalRecord:
     goal: Goal
     wall_deadline: float
     execution_deadline: float
     ending: _Ending | None = None
+    dispatch_write: Future[None] | None = None
+    evaluation: _GoalEvaluation | None = None
 
 
 @dataclass
@@ -279,6 +298,14 @@ class _StreamRecord:
     # Recent acknowledgements by sequence, with the digest of the update that earned each.
     acks: OrderedDict[int, tuple[str, TargetAck]]
     ending: str | None = None
+    dispatch_write: Future[None] | None = None
+
+
+@dataclass
+class _Management:
+    operation: Operation
+    result: Future[dict[str, Any]]
+    deadline: float | None
 
 
 def _ns(seconds: float) -> str:
@@ -308,7 +335,14 @@ class Runtime:
         self._limits = (limits or ServiceLimits()).model_copy(update={"journal_quota": journal.quota})
         self._history = History(robot_id, boot_id, self._limits)
         self._lock = threading.RLock()
+        self._admission = threading.Lock()
         self._facts = backend.describe()
+        unregistered = sorted({binding.profile for binding in self._facts.bindings} - PROFILES.keys())
+        if unregistered:
+            raise StartupError(
+                f"{type(backend).__name__} binds {', '.join(unregistered)}, which no one registered; pass each "
+                "profile to homunculus.profiles.register() before the service starts"
+            )
         self._epoch = 0
         self.context_id = self._context(0)
 
@@ -326,13 +360,16 @@ class Runtime:
             for spec in self._facts.resources
         }
         self._stop_queue: set[str] = set()
+        self._stop_generation = 0
 
         self._session: _Session | None = None
+        self._last_session: Session | None = None
         self._goals: dict[str, _GoalRecord] = {}
         self._streams: dict[str, _StreamRecord] = {}
         self._operations: dict[str, Operation] = {}
         self._awaited: dict[str, list[str]] = {}  # operation id -> resources it waits on
-        self._management: list[tuple[Operation, ManagementRequest]] = []
+        self._management: deque[tuple[Operation, ManagementRequest]] = deque()
+        self._transition_in_progress: _Management | None = None
 
         self._ticks = 0
         self._last_tick: float | None = None
@@ -369,11 +406,12 @@ class Runtime:
             self._last_tick = now
             self._ticks += 1
 
+            self._expire(now)
+            self._dispatch_stops()
             self._feedback = self._read_backend()
             self._feedback_time = now
             self._state_sequence += 1
 
-            self._expire(now)
             self._settle_resources(now)
             self._progress_goals(now)
             self._progress_streams(now)
@@ -571,51 +609,66 @@ class Runtime:
     # ------------------------------------------------------------------
 
     def open_session(self, principal: Principal, request: SessionOpen) -> Session:
-        with self._lock:
-            now = self._clock.now()
-            self._expire(now)
-            body = request.model_dump(mode="json")
+        body = request.model_dump(mode="json")
+        with self._admission:
             prior = self._replay(principal, request.request_id, body, "session")
             if prior is not None:
-                return self._session_view(prior.operation_id, now) or Session.model_validate(prior.document)
-            self._check_context(request.context_id)
-            lifetime = self._lifetime(request.lifetime_wall_s, self._limits.default_session_lifetime_wall_s)
-            if request.takeover:
-                if not principal.operator:
-                    raise RobotError("permission_denied", "takeover needs operator permission")
-                # Revoke first. The old owner's activity must finish stopping before anyone else may command.
-                self._end_session("revoked", "operator_takeover", now)
-            if self._session is not None:
-                holder = self._session
-                raise RobotError(
-                    "session_conflict",
-                    f"principal {holder.public.principal!r} holds the control session for this robot",
-                    principal=holder.public.principal,
-                    expires_in_s=max(0.0, holder.expires_at - now),
+                with self._lock:
+                    now = self._clock.now()
+                    self._expire(now)
+                    live = self._session_view(prior.operation_id, now)
+                if live is not None:
+                    return live
+                return self._ended_session(prior.operation_id) or Session.model_validate(prior.document)
+            with self._lock:
+                now = self._clock.now()
+                self._expire(now)
+                self._check_context(request.context_id)
+                lifetime = self._lifetime(request.lifetime_wall_s, self._limits.default_session_lifetime_wall_s)
+                if request.takeover:
+                    if not principal.operator:
+                        raise RobotError("permission_denied", "takeover needs operator permission")
+                    # Revoke first. The old owner's activity must finish stopping before anyone else may command.
+                    self._end_session("revoked", "operator_takeover", now)
+                if self._session is not None:
+                    holder = self._session
+                    raise RobotError(
+                        "session_conflict",
+                        f"principal {holder.public.principal!r} holds the control session for this robot",
+                        principal=holder.public.principal,
+                        expires_in_s=max(0.0, holder.expires_at - now),
+                    )
+                stopping = [rid for rid, r in self._resources.items() if r.status.condition == "stopping"]
+                if stopping:
+                    raise RobotError(
+                        "resource_busy",
+                        "the previous owner's activity is still stopping; open the session once that is confirmed",
+                        resources=stopping,
+                    )
+                session = Session(
+                    session_id=_new_id("ses"),
+                    robot_id=self.robot_id,
+                    context_id=self.context_id,
+                    principal=principal.name,
+                    state="active",
+                    lifetime_wall_s=lifetime,
+                    expires_at_ns=_ns(now + lifetime),
+                    expires_in_s=lifetime,
                 )
-            stopping = [rid for rid, r in self._resources.items() if r.status.condition == "stopping"]
-            if stopping:
-                raise RobotError(
-                    "resource_busy",
-                    "the previous owner's activity is still stopping; open the session once that is confirmed",
-                    resources=stopping,
-                )
-            session = Session(
-                session_id=_new_id("ses"),
-                robot_id=self.robot_id,
-                context_id=self.context_id,
-                principal=principal.name,
-                state="active",
-                lifetime_wall_s=lifetime,
-                expires_at_ns=_ns(now + lifetime),
-                expires_in_s=lifetime,
-            )
             self._admit(
                 principal, "session", session.session_id, request_id=request.request_id, request=body, document=session
             )
-            self._session = _Session(session, now + lifetime)
-            self._history.emit("session.opened", now, session_id=session.session_id, principal=principal.name)
-            return session.model_copy()
+            with self._lock:
+                self._session = _Session(session, now + lifetime)
+                now = self._clock.now()
+                if session.context_id != self.context_id:
+                    self._end_session("revoked", "stale_context", now)
+                    return session.model_copy()
+                self._expire(now)
+                if self._session is None:
+                    return session.model_copy()
+                self._history.emit("session.opened", now, session_id=session.session_id, principal=principal.name)
+                return self._session_view(session.session_id, now)
 
     def renew_session(self, principal: Principal, session_id: str, request: SessionRenew) -> Session:
         """Extend the session only. Goal deadlines and stream targets are untouched."""
@@ -633,12 +686,14 @@ class Runtime:
         with self._lock:
             now = self._clock.now()
             self._expire(now)
-            ended = self._ended_session(session_id)
-            if ended is not None and ended.principal == principal.name:
-                return ended  # closing it again changes nothing
-            session = self._own_session(principal, session_id)
-            self._end_session("closed", "client_closed", now)
-            return session.public.model_copy()
+            if self._session is not None and self._session.public.session_id == session_id:
+                session = self._own_session(principal, session_id)
+                self._end_session("closed", "client_closed", now)
+                return session.public.model_copy()
+        ended = self._ended_session(session_id)
+        if ended is not None and ended.principal == principal.name:
+            return ended  # closing it again changes nothing
+        return self._invalid_session(session_id, ended)
 
     def _lifetime(self, requested: float | None, default: float) -> float:
         lifetime = requested or default
@@ -663,7 +718,12 @@ class Runtime:
 
     def _ended_session(self, session_id: str | None) -> Session | None:
         """How a session that is over ended. The journal is its only record, so this holds in any boot."""
-        entry = self._journal.find(self.robot_id, session_id or "")
+        if session_id is None or not session_id.startswith("ses-"):
+            return None
+        outcome = self._journal.outcome(self.robot_id, session_id)
+        if outcome is not None:
+            return Session.model_validate(outcome)
+        entry = self._journal.find(self.robot_id, session_id)
         if entry is None or entry.kind != "session" or not entry.finished:
             return None
         return Session.model_validate(entry.document)
@@ -697,18 +757,22 @@ class Runtime:
     def _own_session(self, principal: Principal, session_id: str | None) -> _Session:
         session = self._session
         if session is None or session.public.session_id != session_id:
-            ended = self._ended_session(session_id)
-            state = ended.state if ended else "unknown"
-            raise RobotError(
-                "session_invalid",
-                f"session {session_id} is {state}; open a new session to command this robot",
-                session_id=session_id,
-                state=state,
-                reason=ended.reason if ended else None,
-            )
+            ended = self._last_session
+            self._invalid_session(session_id, ended if ended is not None and ended.session_id == session_id else None)
         if session.public.principal != principal.name:
             raise RobotError("permission_denied", "this session belongs to another principal")
         return session
+
+    @staticmethod
+    def _invalid_session(session_id: str | None, ended: Session | None) -> NoReturn:
+        state = ended.state if ended else "unknown"
+        raise RobotError(
+            "session_invalid",
+            f"session {session_id} is {state}; open a new session to command this robot",
+            session_id=session_id,
+            state=state,
+            reason=ended.reason if ended else None,
+        )
 
     def _end_session(self, state: str, reason: str, now: float) -> None:
         """Revoke authority and stop what it commanded. Retained holds stay in place."""
@@ -719,6 +783,7 @@ class Runtime:
         public = session.public
         public.state, public.reason, public.expires_in_s = state, reason, 0.0
         public.expires_at_ns = _ns(min(session.expires_at, now))
+        self._last_session = public
         goal_state, goal_reason = {
             "closed": ("cancelled", "session_closed"),
             "expired": ("failed", "session_expired"),
@@ -731,7 +796,7 @@ class Runtime:
                 self._end_stream(stream, "interrupted", now, goal_reason)
         # Written after the stopping above is under way. The journal is the one record of a session that is
         # over: a repeated open or close reads it there, in this boot or a later one.
-        self._journal.record(self.robot_id, public.session_id, public.model_dump(mode="json"), finished=True)
+        self._journal.record_later(self.robot_id, public.session_id, public.model_dump(mode="json"), finished=True)
         self._history.emit(f"session.{state}", now, session_id=public.session_id, reason=reason)
 
     def _context(self, epoch: int) -> str:
@@ -765,45 +830,56 @@ class Runtime:
             return Validation(resources=binding.resources, limits=resolve_stream(request.stream, binding))
 
     def submit_goal(self, principal: Principal, request: GoalSubmit) -> Goal:
-        with self._lock:
-            now = self._clock.now()
-            self._expire(now)
-            body = request.model_dump(mode="json")
+        body = request.model_dump(mode="json")
+        with self._admission:
             prior = self._replay(principal, request.request_id, body, "goal")
             if prior is not None:
-                # The same operation, never a second execution.
-                return self._goal_view(prior.operation_id)
-            self._authority(principal, request.session_id, request.context_id)
-            contract = self._contract(request)
-            self._check_start(contract, now)
-            self._check_free(contract.resources)
-            goal = Goal(
-                goal_id=_new_id("goal"),
-                request_id=request.request_id,
-                robot_id=self.robot_id,
-                context_id=self.context_id,
-                session_id=request.session_id,
-                principal=principal.name,
-                state="accepted",
-                contract=contract,
-                accepted_time_ns=_ns(now),
-            )
-            # Identity and the resolved command are durable before any dispatch.
+                return self.goal(prior.operation_id)
+            with self._lock:
+                now = self._clock.now()
+                self._expire(now)
+                self._authority(principal, request.session_id, request.context_id)
+                contract = self._contract(request)
+                self._check_start(contract, now)
+                self._check_free(contract.resources)
+                goal = Goal(
+                    goal_id=_new_id("goal"),
+                    request_id=request.request_id,
+                    robot_id=self.robot_id,
+                    context_id=self.context_id,
+                    session_id=request.session_id,
+                    principal=principal.name,
+                    state="accepted",
+                    contract=contract,
+                    accepted_time_ns=_ns(now),
+                )
+                # Identity and the resolved command are durable before any dispatch.
+                record = _GoalRecord(
+                    goal,
+                    # Both deadlines start at admission; activation is recorded separately.
+                    wall_deadline=now + contract.max_wall_s,
+                    execution_deadline=self._feedback.execution_time_s + contract.max_execution_s,
+                )
+                stop_generation = self._stop_generation
             self._admit(principal, "goal", goal.goal_id, request_id=request.request_id, request=body, document=goal)
-            self._goals[goal.goal_id] = _GoalRecord(
-                goal,
-                # Both deadlines start at admission; activation is recorded separately.
-                wall_deadline=now + contract.max_wall_s,
-                execution_deadline=self._feedback.execution_time_s + contract.max_execution_s,
-            )
-            for rid in contract.resources:
-                self._resources[rid].status.activity = goal.goal_id
-            self._history.emit("goal.accepted", now, goal_id=goal.goal_id, profile=contract.action.profile)
-            return goal.model_copy(deep=True)
+            with self._lock:
+                now = self._clock.now()
+                self._expire(now)
+                self._goals[goal.goal_id] = record
+                if reason := self._admission_interrupted(goal.context_id, stop_generation, goal.session_id):
+                    self._finish_goal(record, "cancelled", reason, now)
+                    return goal.model_copy(deep=True)
+                for rid in contract.resources:
+                    self._resources[rid].status.activity = goal.goal_id
+                self._history.emit("goal.accepted", now, goal_id=goal.goal_id, profile=contract.action.profile)
+                return goal.model_copy(deep=True)
 
     def goal(self, goal_id: str) -> Goal:
         with self._lock:
-            return self._goal_view(goal_id)
+            record = self._goals.get(goal_id)
+            if record is not None:
+                return record.goal.model_copy(deep=True)
+        return Goal.model_validate(self._stored(goal_id, "goal"))
 
     def cancel_goal(self, principal: Principal, goal_id: str, authority: Authority) -> Goal:
         """Stop this goal only. Cancelling a finished goal changes nothing."""
@@ -811,22 +887,18 @@ class Runtime:
             now = self._clock.now()
             self._expire(now)
             record = self._goals.get(goal_id)
-            if record is None or record.goal.state in TERMINAL_GOAL_STATES:
-                return self._goal_view(goal_id)
-            if not self._may_end(principal, authority) and record.goal.session_id != authority.session_id:
-                raise RobotError("permission_denied", "this goal belongs to another session")
-            self._end_goal(record, _Ending("cancelled", "cancelled"), now)
-            return record.goal.model_copy(deep=True)
-
-    def _goal_view(self, goal_id: str) -> Goal:
-        record = self._goals.get(goal_id)
-        if record is not None:
-            return record.goal.model_copy(deep=True)
+            if record is not None:
+                if record.goal.state not in TERMINAL_GOAL_STATES:
+                    if not self._may_end(principal, authority) and record.goal.session_id != authority.session_id:
+                        raise RobotError("permission_denied", "this goal belongs to another session")
+                    self._end_goal(record, _Ending("cancelled", "cancelled"), now)
+                return record.goal.model_copy(deep=True)
         return Goal.model_validate(self._stored(goal_id, "goal"))
 
     def _contract(self, goal: GoalSpec) -> Contract:
         """Resolve a proposed goal against its binding into the concrete command that would run."""
-        binding = find_binding(self._facts.bindings, goal.action.profile, goal.action.target, "goal")
+        # A request of an unregistered profile has no target field; no binding offers its profile either.
+        binding = find_binding(self._facts.bindings, goal.action.profile, getattr(goal.action, "target", ""), "goal")
         self._require_available(binding)
         deadlines = {
             "max_execution_s": goal.max_execution_s or self._limits.default_max_execution_s,
@@ -843,11 +915,12 @@ class Runtime:
         conditions = goal.start_conditions
         if conditions is not None and conditions.max_position_change is not None and conditions.observation_id is None:
             raise RobotError("invalid_request", "max_position_change needs the observation_id it is measured from")
-        action = resolve_action(goal.action, binding)
+        profile = PROFILES[goal.action.profile]
+        action = profile.resolve(goal.action, binding.limits)
         # A goal that states how long its motion takes cannot succeed under a deadline that ends before the
         # motion and its settling do, so it is refused here instead of being moved and then failed. Execution
         # time never runs ahead of a realtime clock; the wall time of a stepped world says nothing about it.
-        stated, settling = stated_duration_s(action), binding.limits.settle_time_s
+        stated, settling = profile.duration_s(action), binding.limits.settle_time_s
         bounded = ("max_execution_s", "max_wall_s") if self._facts.clock_mode == "realtime" else ("max_execution_s",)
         for name in bounded:
             if stated is not None and stated + settling >= deadlines[name]:
@@ -874,10 +947,8 @@ class Runtime:
         Returns the action as it would start now; a trajectory is bound to the measured joint state.
         """
         self._require_measured(contract.resources)
-        action = contract.action
-        if isinstance(action, JointTrajectoryGoal):
-            values = self._feedback.samples[contract.resources[0]].values
-            action = activate_trajectory(action, contract.limits, values["positions"], values["velocities"])
+        reading = Reading(self._feedback.samples[contract.resources[0]].values, self._feedback.execution_time_s)
+        action = PROFILES[contract.action.profile].activate(contract.action, contract.limits, reading)
         conditions = contract.start_conditions
         if conditions is None:
             return action
@@ -946,33 +1017,77 @@ class Runtime:
                 condition = self._resources[rid].status.condition
                 if condition != "ready":
                     raise RobotError("start_condition_failed", f"resource {rid!r} became {condition}", resource=rid)
-            contract.action = self._check_start(contract, now)
-            goal.activated_time_ns = _ns(now)
-            goal.state = "executing"
-            # Durable before dispatch: after a crash this goal reads as possibly dispatched.
-            self._journal.record(self.robot_id, goal.goal_id, goal.model_dump(mode="json"), finished=False)
-            self._backend.apply(goal.goal_id, contract)
+            action = self._check_start(contract, now)
         except Exception as error:
             if not isinstance(error, RobotError):
-                log.exception("backend rejected goal %s", goal.goal_id)
+                log.exception("could not check the start conditions of goal %s", goal.goal_id)
                 error = RobotError("backend_error", str(error))
-            goal.activated_time_ns = None
-            for rid in contract.resources:
-                # Release the reservation; what the resource retained before is untouched.
-                self._resources[rid].status.activity = None
-            self._finish_goal(
-                record,
-                "failed",
-                "precondition_changed",
-                now,
-                detail=error.message,
-                measurements={"code": error.code, **error.details},
-            )
+            ending = _Ending("failed", "precondition_changed", error.message, {"code": error.code, **error.details})
+            self._end_goal(record, ending, now)
             return
+
+        write = record.dispatch_write
+        if write is None:
+            # The durable marker records intent. Start conditions are checked again before the send.
+            document = goal.model_dump(mode="json")
+            document["state"] = "executing"
+            record.dispatch_write = self._journal.record_later(self.robot_id, goal.goal_id, document, finished=False)
+            return
+        if not write.done():
+            return
+        if (error := write.exception()) is not None:
+            self._end_goal(record, _Ending("failed", "journal_error", str(error)), now)
+            return
+
+        contract.action = action
+        try:
+            judge = self._create_judge(contract)
+        except (TypeError, ValueError, KeyError) as error:
+            self._end_goal(record, _Ending("failed", "feedback_lost", str(error)), now)
+            return
+        started = self._feedback.execution_time_s
+        record.evaluation = _GoalEvaluation(judge, started, started)
+        command = contract
+        if self._backend.reports_goal_samples:
+            command = GoalCommand.model_construct(**dict(contract), judge=judge)
+        goal.activated_time_ns = _ns(now)
+        goal.state = "executing"
         for rid in contract.resources:
             status = self._resources[rid].status
             status.condition, status.retained = "active", None
+        try:
+            self._backend.apply(goal.goal_id, command)
+        except Exception as error:
+            log.exception("delivery of goal %s is uncertain", goal.goal_id)
+            self._end_goal(record, _Ending("failed", "backend_error", str(error)), now)
+            self._dispatch_stops()
+            return
         self._history.emit("goal.executing", now, goal_id=goal.goal_id)
+
+    def _create_judge(self, contract: Contract) -> MotionJudge:
+        reading = Reading(self._feedback.samples[contract.resources[0]].values, self._feedback.execution_time_s)
+        return PROFILES[contract.action.profile].judge(contract.action, contract.limits, reading)
+
+    def _evaluate_goal(self, record: _GoalRecord) -> ActivityStatus | None:
+        evaluation = record.evaluation
+        judge = evaluation.judge
+        if self._backend.reports_goal_samples:
+            return judge.status
+        contract = record.goal.contract
+        rid = contract.resources[0]
+        sample = self._feedback.samples[rid]
+        time_s = int(sample.capture_time_ns) / 1e9
+        if time_s <= evaluation.last_sample_s:
+            return judge.status
+        reading = Reading(
+            sample.values,
+            time_s,
+            elapsed_s=time_s - evaluation.started_s,
+            dt_s=time_s - evaluation.last_sample_s,
+            still_for_s=contract.limits.settle_time_s if self._feedback.stopped.get(rid, False) else 0.0,
+        )
+        evaluation.last_sample_s = time_s
+        return PROFILES[contract.action.profile].measure(judge, reading)
 
     def _progress_goals(self, now: float) -> None:
         for record in list(self._goals.values()):
@@ -1017,8 +1132,24 @@ class Runtime:
                     self._end_goal(record, _Ending("failed", "execution_deadline_exceeded"), now)
                 elif now >= record.wall_deadline:
                     self._end_goal(record, _Ending("failed", "wall_deadline_exceeded"), now)
-                elif status.phase == "done":
-                    # Success comes from the controller's measured completion, not from the command being sent.
+                else:
+                    try:
+                        verdict = self._evaluate_goal(record)
+                    except (KeyError, TypeError, ValueError) as error:
+                        self._end_goal(record, _Ending("failed", "feedback_lost", str(error)), now)
+                        continue
+                    if verdict is not None and verdict.phase == "failed":
+                        self._end_goal(
+                            record, _Ending("failed", verdict.error, verdict.detail, verdict.measurements), now
+                        )
+                        continue
+                    if status.phase != "done":
+                        goal.state = status.phase
+                        continue
+                    if verdict is None or verdict.phase != "done":
+                        ending = _Ending("failed", "completion_unverified", "measurements did not verify completion")
+                        self._end_goal(record, ending, now)
+                        continue
                     for resource in resources:
                         resource.condition, resource.activity = "ready", None
                     self._set_holding(
@@ -1032,11 +1163,9 @@ class Runtime:
                         "succeeded",
                         "completed",
                         now,
-                        measurements=status.measurements,
+                        measurements={**status.measurements, **verdict.measurements},
                         observation_id=self._issue(now).observation_id,
                     )
-                else:
-                    goal.state = status.phase
 
     def _end_goal(self, record: _GoalRecord, ending: _Ending, now: float) -> None:
         goal = record.goal
@@ -1044,7 +1173,9 @@ class Runtime:
             # Never dispatched: nothing moved, so there is nothing to stop.
             for rid in goal.contract.resources:
                 self._resources[rid].status.activity = None
-            self._finish_goal(record, ending.state, ending.reason, now, detail=ending.detail)
+            self._finish_goal(
+                record, ending.state, ending.reason, now, detail=ending.detail, measurements=ending.measurements
+            )
         elif goal.state in ("executing", "finishing"):
             record.ending = ending
             goal.state = "stopping"
@@ -1076,7 +1207,7 @@ class Runtime:
         )
         retained = self._resources[goal.contract.resources[0]].status.retained
         goal.retained = retained.model_copy() if retained else None
-        self._journal.record(self.robot_id, goal.goal_id, goal.model_dump(mode="json"), finished=True)
+        self._journal.record_later(self.robot_id, goal.goal_id, goal.model_dump(mode="json"), finished=True)
         self._history.emit(f"goal.{state}", now, goal_id=goal.goal_id, reason=reason)
 
     # ------------------------------------------------------------------
@@ -1084,58 +1215,67 @@ class Runtime:
     # ------------------------------------------------------------------
 
     def open_stream(self, principal: Principal, request: StreamOpen) -> Stream:
-        with self._lock:
-            now = self._clock.now()
-            self._expire(now)
-            body = request.model_dump(mode="json")
+        body = request.model_dump(mode="json")
+        with self._admission:
             prior = self._replay(principal, request.request_id, body, "stream")
             if prior is not None:
-                return self._stream_view(prior.operation_id, now)
-            self._authority(principal, request.session_id, request.context_id)
-            binding = find_binding(self._facts.bindings, request.profile, request.target, "stream")
-            self._require_available(binding)
-            limits = resolve_stream(request, binding)
-            self._check_free(binding.resources)
-            self._require_measured(binding.resources)
-            # The initial target is sequence zero and obeys the same freshness rule.
-            expires_at, basis_sequence = self._basis_expiry(
-                request.basis_observation_id, binding.resources, request.update_validity_wall_s, now, 0
-            )
-            stream_id = _new_id("str")
-            stream = Stream(
-                stream_id=stream_id,
-                request_id=request.request_id,
-                robot_id=self.robot_id,
-                context_id=self.context_id,
-                session_id=request.session_id,
-                principal=principal.name,
-                profile=request.profile,
-                target=request.target,
-                resources=binding.resources,
-                limits=limits,
-                update_validity_wall_s=request.update_validity_wall_s,
-                state="open",
-                accepted_sequence=0,
-                expires_at_ns=_ns(expires_at),
-                expires_in_s=expires_at - now,
-                update_path=f"/v1/robots/{self.robot_id}/streams/{stream_id}/target",
-                persistent_channel=NO_CHANNEL,
-            )
+                return self.stream(prior.operation_id)
+            with self._lock:
+                now = self._clock.now()
+                self._expire(now)
+                self._authority(principal, request.session_id, request.context_id)
+                binding = find_binding(self._facts.bindings, request.profile, request.target, "stream")
+                self._require_available(binding)
+                limits = resolve_stream(request, binding)
+                self._check_free(binding.resources)
+                self._require_measured(binding.resources)
+                # The initial target is sequence zero and obeys the same freshness rule.
+                expires_at, basis_sequence = self._basis_expiry(
+                    request.basis_observation_id, binding.resources, request.update_validity_wall_s, now, 0
+                )
+                stream_id = _new_id("str")
+                stream = Stream(
+                    stream_id=stream_id,
+                    request_id=request.request_id,
+                    robot_id=self.robot_id,
+                    context_id=self.context_id,
+                    session_id=request.session_id,
+                    principal=principal.name,
+                    profile=request.profile,
+                    target=request.target,
+                    resources=binding.resources,
+                    limits=limits,
+                    update_validity_wall_s=request.update_validity_wall_s,
+                    state="open",
+                    accepted_sequence=0,
+                    expires_at_ns=_ns(expires_at),
+                    expires_in_s=expires_at - now,
+                    update_path=f"/v1/robots/{self.robot_id}/streams/{stream_id}/target",
+                    persistent_channel=NO_CHANNEL,
+                )
+                stop_generation = self._stop_generation
             self._admit(principal, "stream", stream_id, request_id=request.request_id, request=body, document=stream)
-            ack = TargetAck(
-                sequence=0, basis_observation_id=request.basis_observation_id, expires_at_ns=_ns(expires_at)
-            )
-            self._streams[stream_id] = _StreamRecord(
-                stream,
-                expires_at,
-                basis_sequence,
-                mailbox=request.initial_target,
-                acks=OrderedDict({0: (digest(request.initial_target.model_dump(mode="json")), ack)}),
-            )
-            for rid in binding.resources:
-                self._resources[rid].status.activity = stream_id
-            self._history.emit("stream.opened", now, stream_id=stream_id, profile=request.profile)
-            return self._stream_view(stream_id, now)
+            with self._lock:
+                now = self._clock.now()
+                self._expire(now)
+                self._streams[stream_id] = _StreamRecord(
+                    stream,
+                    expires_at,
+                    basis_sequence,
+                    mailbox=request.initial_target,
+                    acks=OrderedDict(),
+                )
+                record = self._streams[stream_id]
+                if reason := self._admission_interrupted(stream.context_id, stop_generation, stream.session_id):
+                    self._close_stream(record, "interrupted", now, reason)
+                    return self._stream_view(record, now)
+                if now >= expires_at:
+                    self._close_stream(record, "expired", now, "target expired during admission")
+                    return self._stream_view(record, now)
+                for rid in binding.resources:
+                    self._resources[rid].status.activity = stream_id
+                self._history.emit("stream.opened", now, stream_id=stream_id, profile=request.profile)
+                return self._stream_view(record, now)
 
     def update_stream(self, principal: Principal, stream_id: str, request: StreamUpdate) -> StreamUpdateResult:
         with self._lock:
@@ -1143,83 +1283,85 @@ class Runtime:
             # Expiry runs first, under the same lock: a late packet cannot revive an expired stream.
             self._expire(now)
             record = self._streams.get(stream_id)
-            if record is None:
-                stored = self._stream_view(stream_id, now)
-                raise RobotError("stream_closed", "this stream is closed", state=stored.state, closure=stored.closure)
-            stream = record.stream
-            # A stream stays bound to the session and context that opened it.
-            self._authority(principal, request.session_id, request.context_id)
-            if request.session_id != stream.session_id:
-                raise RobotError("permission_denied", "this stream belongs to another session")
-            body_digest = digest(request.model_dump(mode="json"))
-            known = record.acks.get(request.sequence)
-            if known is not None:
-                if known[0] != body_digest:
+            if record is not None:
+                stream = record.stream
+                # A stream stays bound to the session and context that opened it.
+                self._authority(principal, request.session_id, request.context_id)
+                if request.session_id != stream.session_id:
+                    raise RobotError("permission_denied", "this stream belongs to another session")
+                body_digest = digest(request.model_dump(mode="json"))
+                known = record.acks.get(request.sequence)
+                if known is not None:
+                    if known[0] != body_digest:
+                        raise RobotError(
+                            "sequence_conflict",
+                            f"sequence {request.sequence} was already accepted with different data",
+                            sequence=request.sequence,
+                        )
+                    # The original acknowledgement; expiry is not extended.
+                    return StreamUpdateResult(ack=known[1], duplicate=True, stream=self._stream_view(record, now))
+                if stream.state != "open":
                     raise RobotError(
-                        "sequence_conflict",
-                        f"sequence {request.sequence} was already accepted with different data",
-                        sequence=request.sequence,
+                        "stream_closed",
+                        f"this stream is {stream.state}; a late update cannot reopen it",
+                        state=stream.state,
+                        closure=stream.closure or record.ending,
                     )
-                # The original acknowledgement; expiry is not extended.
-                return StreamUpdateResult(ack=known[1], duplicate=True, stream=self._stream_view(stream_id, now))
-            if stream.state != "open":
-                raise RobotError(
-                    "stream_closed",
-                    f"this stream is {stream.state}; a late update cannot reopen it",
-                    state=stream.state,
-                    closure=stream.closure or record.ending,
+                if request.sequence <= stream.accepted_sequence:
+                    raise RobotError(
+                        "sequence_rejected",
+                        f"sequence {request.sequence} is not above the accepted sequence {stream.accepted_sequence}",
+                        accepted_sequence=stream.accepted_sequence,
+                    )
+                check_velocity(request.target, stream.limits)
+                expires_at, basis_sequence = self._basis_expiry(
+                    request.basis_observation_id,
+                    stream.resources,
+                    stream.update_validity_wall_s,
+                    now,
+                    record.basis_sequence,
                 )
-            if request.sequence <= stream.accepted_sequence:
-                raise RobotError(
-                    "sequence_rejected",
-                    f"sequence {request.sequence} is not above the accepted sequence {stream.accepted_sequence}",
-                    accepted_sequence=stream.accepted_sequence,
+                ack = TargetAck(
+                    sequence=request.sequence,
+                    basis_observation_id=request.basis_observation_id,
+                    expires_at_ns=_ns(expires_at),
                 )
-            check_velocity(request.target, stream.limits)
-            expires_at, basis_sequence = self._basis_expiry(
-                request.basis_observation_id,
-                stream.resources,
-                stream.update_validity_wall_s,
-                now,
-                record.basis_sequence,
-            )
-            ack = TargetAck(
-                sequence=request.sequence,
-                basis_observation_id=request.basis_observation_id,
-                expires_at_ns=_ns(expires_at),
-            )
-            record.acks[request.sequence] = (body_digest, ack)
-            while len(record.acks) > 16:
-                record.acks.popitem(last=False)
-            # Superseded targets are not replayed: only the newest waits for the controller tick.
-            record.mailbox = request.target
-            record.expires_at = expires_at
-            record.basis_sequence = basis_sequence
-            stream.accepted_sequence = request.sequence
-            return StreamUpdateResult(ack=ack, duplicate=False, stream=self._stream_view(stream_id, now))
+                record.acks[request.sequence] = (body_digest, ack)
+                while len(record.acks) > 16:
+                    record.acks.popitem(last=False)
+                # Superseded targets are not replayed: only the newest waits for the controller tick.
+                record.mailbox = request.target
+                record.expires_at = expires_at
+                record.basis_sequence = basis_sequence
+                stream.accepted_sequence = request.sequence
+                return StreamUpdateResult(ack=ack, duplicate=False, stream=self._stream_view(record, now))
+        stored = Stream.model_validate(self._stored(stream_id, "stream"))
+        raise RobotError("stream_closed", "this stream is closed", state=stored.state, closure=stored.closure)
 
     def stream(self, stream_id: str) -> Stream:
         with self._lock:
             now = self._clock.now()
             self._expire(now)
-            return self._stream_view(stream_id, now)
+            record = self._streams.get(stream_id)
+            if record is not None:
+                return self._stream_view(record, now)
+        return Stream.model_validate(self._stored(stream_id, "stream"))
 
     def close_stream(self, principal: Principal, stream_id: str, authority: Authority) -> Stream:
         with self._lock:
             now = self._clock.now()
             self._expire(now)
             record = self._streams.get(stream_id)
-            if record is None or record.stream.state != "open":
-                return self._stream_view(stream_id, now)
-            if not self._may_end(principal, authority) and record.stream.session_id != authority.session_id:
-                raise RobotError("permission_denied", "this stream belongs to another session")
-            self._end_stream(record, "client_closed", now)
-            return self._stream_view(stream_id, now)
+            if record is not None:
+                if record.stream.state == "open":
+                    if not self._may_end(principal, authority) and record.stream.session_id != authority.session_id:
+                        raise RobotError("permission_denied", "this stream belongs to another session")
+                    self._end_stream(record, "client_closed", now)
+                return self._stream_view(record, now)
+        return Stream.model_validate(self._stored(stream_id, "stream"))
 
-    def _stream_view(self, stream_id: str, now: float) -> Stream:
-        record = self._streams.get(stream_id)
-        if record is None:
-            return Stream.model_validate(self._stored(stream_id, "stream"))
+    @staticmethod
+    def _stream_view(record: _StreamRecord, now: float) -> Stream:
         remaining = max(0.0, record.expires_at - now) if record.stream.state == "open" else 0.0
         return record.stream.model_copy(
             update={"expires_at_ns": _ns(record.expires_at), "expires_in_s": remaining}, deep=True
@@ -1282,26 +1424,35 @@ class Runtime:
                 self._end_stream(record, "failed", now, "feedback_lost")
                 continue
             first = stream.applied_sequence is None
-            try:
-                if first:
-                    # Durable before the first dispatch: after a crash this stream reads as one that may have
-                    # moved its resources. Later targets are not journalled; that would put a disk write in
-                    # every control tick.
-                    dispatched = self._stream_view(stream.stream_id, now)
-                    dispatched.applied_sequence = stream.accepted_sequence
-                    self._journal.record(
-                        self.robot_id, stream.stream_id, dispatched.model_dump(mode="json"), finished=False
-                    )
-                self._backend.track(stream.stream_id, stream.target, record.mailbox, stream.limits)
-            except Exception as error:
-                log.exception("a stream target could not be dispatched")
-                self._end_stream(record, "failed", now, f"backend_error: {error}")
-                continue
-            stream.applied_sequence, record.mailbox = stream.accepted_sequence, None
             if first:
+                write = record.dispatch_write
+                if write is None:
+                    document = self._stream_view(record, now).model_dump(mode="json")
+                    document["dispatch_pending"] = True
+                    record.dispatch_write = self._journal.record_later(
+                        self.robot_id, stream.stream_id, document, finished=False
+                    )
+                    continue
+                if not write.done():
+                    continue
+                if (error := write.exception()) is not None:
+                    self._end_stream(record, "failed", now, f"journal_error: {error}")
+                    continue
                 for rid in stream.resources:
                     status = self._resources[rid].status
                     status.condition, status.retained = "active", None
+            try:
+                self._backend.track(stream.stream_id, stream.target, record.mailbox, stream.limits)
+            except Exception as error:
+                log.exception("delivery of stream %s is uncertain", stream.stream_id)
+                self._stop_stream(record, "failed", now, f"backend_error: {error}")
+                self._dispatch_stops()
+                continue
+            stream.applied_sequence, record.mailbox = stream.accepted_sequence, None
+            if first:
+                document = self._stream_view(record, now).model_dump(mode="json")
+                document["dispatch_pending"] = False
+                self._journal.record_later(self.robot_id, stream.stream_id, document, finished=False)
 
     def _progress_streams(self, now: float) -> None:
         for record in list(self._streams.values()):
@@ -1335,18 +1486,23 @@ class Runtime:
                 self._resources[rid].status.activity = None
             self._close_stream(record, closure, now, detail)
         else:
-            record.ending = closure
-            stream.state = "stopping"
-            self._begin_stop(stream.resources, now)
-            self._history.emit("stream.stopping", now, stream_id=stream.stream_id, closure=closure)
+            self._stop_stream(record, closure, now, detail)
+
+    def _stop_stream(self, record: _StreamRecord, closure: str, now: float, detail: str | None) -> None:
+        stream = record.stream
+        record.mailbox = None
+        record.ending = closure
+        stream.detail, stream.state = detail, "stopping"
+        self._begin_stop(stream.resources, now)
+        self._history.emit("stream.stopping", now, stream_id=stream.stream_id, closure=closure)
 
     def _close_stream(self, record: _StreamRecord, closure: str, now: float, detail: str | None = None) -> None:
         stream = record.stream
         stream.state, stream.closure = "closed", closure
         stream.detail = detail or stream.detail
         record.mailbox = None
-        view = self._stream_view(stream.stream_id, now)
-        self._journal.record(self.robot_id, stream.stream_id, view.model_dump(mode="json"), finished=True)
+        view = self._stream_view(record, now)
+        self._journal.record_later(self.robot_id, stream.stream_id, view.model_dump(mode="json"), finished=True)
         self._history.emit("stream.closed", now, stream_id=stream.stream_id, closure=closure)
 
     # ------------------------------------------------------------------
@@ -1363,18 +1519,18 @@ class Runtime:
             now = self._clock.now()
             self._expire(now)
             self._may_end(principal, authority)
+            self._stop_generation += 1
             operation = self._new_operation("stop", principal, now)
             self._operations[operation.operation_id] = operation
+            # Every resource is awaited, including a faulted resource whose standstill could not be confirmed.
+            self._awaited[operation.operation_id] = list(self._resources)
+            self._begin_stop(list(self._resources), now)
             for record in self._goals.values():
                 if record.goal.state not in TERMINAL_GOAL_STATES:
                     self._end_goal(record, _Ending("cancelled", "stopped"), now)
             for stream in self._streams.values():
                 if stream.stream.state == "open":
                     self._end_stream(stream, "interrupted", now, "stopped")
-            # Every resource is awaited: one that is already faulted has no measured standstill to report,
-            # so the stop ends as stop_unconfirmed instead of succeeding around it.
-            self._awaited[operation.operation_id] = list(self._resources)
-            self._begin_stop(list(self._resources), now)
             self._history.emit("stop.requested", now, operation_id=operation.operation_id, principal=principal.name)
             return operation.model_copy(deep=True)
 
@@ -1402,6 +1558,9 @@ class Runtime:
 
     def _check_free(self, resources: Sequence[str]) -> None:
         """One goal or stream per resource group, and no queue of future motion."""
+        if self._transition_in_progress is not None:
+            operation = self._transition_in_progress.operation
+            raise RobotError("resource_busy", f"{operation.kind} is still running", operation_id=operation.operation_id)
         for rid in resources:
             status = self._resources[rid].status
             if status.condition == "stopping" or status.activity is not None:
@@ -1489,25 +1648,27 @@ class Runtime:
 
     def manage(self, principal: Principal, request: ManagementRequest) -> Operation:
         """Queue an advertised operation. The control thread performs it on its next tick."""
-        with self._lock:
-            now = self._clock.now()
-            self._expire(now)
-            if not principal.operator:
-                raise RobotError("permission_denied", "management operations need operator permission")
-            body = request.model_dump(mode="json")
+        if not principal.operator:
+            raise RobotError("permission_denied", "management operations need operator permission")
+        body = request.model_dump(mode="json")
+        with self._admission:
             prior = self._replay(principal, request.request_id, body, "management")
             if prior is not None:
-                return self._operation_view(prior.operation_id)
-            self._check_context(request.context_id)
-            if request.operation not in self._facts.management:
-                raise RobotError(
-                    "unsupported_operation",
-                    f"{request.operation} is not available on this robot",
-                    operation=request.operation,
-                    supported=self._facts.management,
-                )
-            operation = self._new_operation(request.operation, principal, now)
-            # Journalled before it is kept: a request the journal refuses leaves no operation behind.
+                return self.operation(prior.operation_id)
+            with self._lock:
+                now = self._clock.now()
+                self._expire(now)
+                self._check_context(request.context_id)
+                if request.operation not in self._facts.management:
+                    raise RobotError(
+                        "unsupported_operation",
+                        f"{request.operation} is not available on this robot",
+                        operation=request.operation,
+                        supported=self._facts.management,
+                    )
+                operation = self._new_operation(request.operation, principal, now)
+                # Journalled before it is kept: a request the journal refuses leaves no operation behind.
+                stop_generation = self._stop_generation
             self._admit(
                 principal,
                 "management",
@@ -1516,16 +1677,24 @@ class Runtime:
                 request=body,
                 document=operation,
             )
-            self._operations[operation.operation_id] = operation
-            self._management.append((operation, request))
-            self._history.emit(
-                "management.requested", now, operation_id=operation.operation_id, operation=request.operation
-            )
-            return operation.model_copy(deep=True)
+            with self._lock:
+                self._operations[operation.operation_id] = operation
+                now = self._clock.now()
+                if reason := self._admission_interrupted(operation.context_id, stop_generation):
+                    self._finish_operation(operation, now, reason, "interrupted while saving the request")
+                    return operation.model_copy(deep=True)
+                self._management.append((operation, request))
+                self._history.emit(
+                    "management.requested", now, operation_id=operation.operation_id, operation=request.operation
+                )
+                return operation.model_copy(deep=True)
 
     def operation(self, operation_id: str) -> Operation:
         with self._lock:
-            return self._operation_view(operation_id)
+            operation = self._operations.get(operation_id)
+            if operation is not None:
+                return operation.model_copy(deep=True)
+        return Operation.model_validate(self._stored(operation_id, "management"))
 
     def _new_operation(self, kind: str, principal: Principal, now: float) -> Operation:
         return Operation(
@@ -1538,15 +1707,30 @@ class Runtime:
             requested_time_ns=_ns(now),
         )
 
-    def _operation_view(self, operation_id: str) -> Operation:
-        operation = self._operations.get(operation_id)
-        if operation is not None:
-            return operation.model_copy(deep=True)
-        return Operation.model_validate(self._stored(operation_id, "management"))
-
     def _run_management(self, now: float) -> None:
-        pending, self._management = self._management, []
-        for operation, request in pending:
+        pending = self._transition_in_progress
+        if pending is not None:
+            operation, result = pending.operation, pending.result
+            if pending.deadline is not None and now >= pending.deadline and not result.done():
+                if not result.cancel():
+                    operation.detail = "waiting for confirmation of the command sent to the backend"
+                pending.deadline = None
+            if not result.done():
+                return
+            self._transition_in_progress = None
+            if result.cancelled():
+                self._finish_operation(operation, now, "backend_error", "the management command timed out in the queue")
+            else:
+                try:
+                    self._complete_transition(operation, now, result.result(), reset_resources=False)
+                except RobotError as error:
+                    self._finish_operation(operation, now, error.code, error.message)
+                except Exception as error:
+                    log.exception("management operation %s failed", operation.kind)
+                    self._finish_operation(operation, now, "backend_error", str(error))
+
+        while self._management and self._transition_in_progress is None:
+            operation, request = self._management.popleft()
             try:
                 # An operation queued behind one that changed the context was not addressed to the new one.
                 self._check_context(operation.context_id)
@@ -1591,18 +1775,26 @@ class Runtime:
         # Queue the fallback first: if the backend refuses the transition, this tick still stops old motion.
         self._begin_stop(list(self._resources), now)
         outcome = self._backend.manage(operation.kind, request.parameters)
+        if isinstance(outcome, Future):
+            self._transition_in_progress = _Management(operation, outcome, now + 60.0)
+        else:
+            self._complete_transition(operation, now, outcome, reset_resources=True)
 
+    def _complete_transition(
+        self, operation: Operation, now: float, outcome: dict[str, Any], *, reset_resources: bool
+    ) -> None:
         self._facts = self._backend.describe()
-        self._stop_queue.clear()
-        self._feedback = self._read_backend()
-        self._feedback_time = now
-        self._state_sequence += 1
-        for resource in self._resources.values():
-            status, measured = resource.status, self._valid(resource.status.id)
-            status.condition, status.activity = ("ready" if measured else "faulted"), None
-            status.fault, status.retained = (None if measured else "feedback_invalid"), None
-            resource.deadline = resource.commanded_at = None
-        self._set_holding(r for r in self._resources.values() if r.status.condition == "ready")
+        if reset_resources:
+            self._stop_queue.clear()
+            self._feedback = self._read_backend()
+            self._feedback_time = now
+            self._state_sequence += 1
+            for resource in self._resources.values():
+                status, measured = resource.status, self._valid(resource.status.id)
+                status.condition, status.activity = ("ready" if measured else "faulted"), None
+                status.fault, status.retained = (None if measured else "feedback_invalid"), None
+                resource.deadline = resource.commanded_at = None
+            self._set_holding(r for r in self._resources.values() if r.status.condition == "ready")
         self._change_context(operation.kind, now)
         operation.new_context_id = self.context_id
         self._finish_operation(operation, now, None, None, outcome)
@@ -1640,7 +1832,10 @@ class Runtime:
         operation.outcome = outcome if outcome is not None else operation.outcome
         operation.resources = {rid: r.status.condition for rid, r in self._resources.items()}
         operation.finished_time_ns = _ns(now)
-        self._journal.record(self.robot_id, operation.operation_id, operation.model_dump(mode="json"), finished=True)
+        if operation.kind != "stop":
+            self._journal.record_later(
+                self.robot_id, operation.operation_id, operation.model_dump(mode="json"), finished=True
+            )
         self._history.emit(
             f"operation.{operation.state}", now, operation_id=operation.operation_id, operation=operation.kind
         )
@@ -1648,6 +1843,20 @@ class Runtime:
     # ------------------------------------------------------------------
     # Journal: request identity and stored results
     # ------------------------------------------------------------------
+
+    def _admission_interrupted(
+        self, context_id: str, stop_generation: int, session_id: str | None = None
+    ) -> str | None:
+        """A command saved without holding the control lock still needs current authority."""
+        if context_id != self.context_id:
+            return "stale_context"
+        if stop_generation != self._stop_generation:
+            return "stopped"
+        if session_id is not None and self._transition_in_progress is not None:
+            return "resource_busy"
+        if session_id is not None and (self._session is None or self._session.public.session_id != session_id):
+            return "session_invalid"
+        return None
 
     def _replay(self, principal: Principal, request_id: str, body: dict[str, Any], kind: str) -> Entry | None:
         """Find an earlier request with this identity. Lookup precedes every context guard."""
@@ -1680,13 +1889,18 @@ class Runtime:
             request_id=request_id,
             kind=kind,
             operation_id=operation_id,
-            context_id=self.context_id,
+            context_id=document.context_id,
             request=request,
             document=document.model_dump(mode="json"),
         )
 
     def _stored(self, operation_id: str, kind: str) -> dict[str, Any]:
         """The journal's copy of a goal, stream, or operation this incarnation no longer holds."""
+        prefix = "op" if kind == "management" else "str" if kind == "stream" else kind
+        if operation_id.startswith(f"{prefix}-"):
+            outcome = self._journal.outcome(self.robot_id, operation_id)
+            if outcome is not None:
+                return outcome
         entry = self._journal.find(self.robot_id, operation_id)
         if entry is None or entry.kind != kind:
             noun = "operation" if kind == "management" else kind
@@ -1715,7 +1929,11 @@ class Runtime:
                 )
                 document = goal.model_dump(mode="json")
             elif entry.kind == "stream":
-                if document["applied_sequence"] is None:
+                pending = document.pop("dispatch_pending", None)
+                if pending or (pending is None and document["applied_sequence"] is not None):
+                    detail = "runtime_restart: a target may have been dispatched"
+                    document["applied_sequence"] = None
+                elif document["applied_sequence"] is None:
                     detail = "runtime_restart: no target had been dispatched"
                 else:
                     detail = "runtime_restart: targets were dispatched; later sequence numbers were not recorded"

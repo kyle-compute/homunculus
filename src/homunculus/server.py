@@ -33,7 +33,7 @@ from starlette.exceptions import HTTPException
 from starlette.types import ASGIApp, Receive, Scope, Send
 
 from . import __version__
-from .journal import Journal, JournalInUse
+from .journal import DemoStart, Journal, JournalInUse, lock_directory
 from .models import (
     ERROR_STATUS,
     Authority,
@@ -74,7 +74,7 @@ BUILT_IN = {
 class Service:
     """The runtimes one process serves, their control and stopping threads, and who may call them.
 
-    The control threads run for the length of a `with` block. Leaving it stops them and then the robots.
+    The control threads run for the length of a `with` block. Each thread leaves its own robot stopped.
     """
 
     def __init__(self, runtimes: dict[str, Runtime], tokens: dict[str, Principal], boot_id: str, limits: ServiceLimits):
@@ -89,44 +89,58 @@ class Service:
         # of the boot before.
         self._video_key = secrets.token_bytes(32)
         self._threads = [
-            threading.Thread(target=self._control, args=(runtime,), name=f"control:{rid}", daemon=True)
+            threading.Thread(target=self._control, args=(runtime,), name=f"control:{rid}")
             for rid, runtime in runtimes.items()
         ]
         # A request that ends motion runs on workers of its robot's own. It then waits neither for one of
         # the workers the other requests share nor behind what is being stopped on another robot.
-        self.stop_workers = {
+        self.end_workers = {
             rid: ThreadPoolExecutor(max_workers=2, thread_name_prefix=f"stop:{rid}") for rid in runtimes
+        }
+        self.stop_workers = {
+            rid: ThreadPoolExecutor(max_workers=1, thread_name_prefix=f"operator-stop:{rid}") for rid in runtimes
         }
 
     def __enter__(self) -> Self:
-        for thread in self._threads:
-            thread.start()
+        try:
+            for thread in self._threads:
+                thread.start()
+        except BaseException:
+            self.__exit__()
+            raise
         return self
 
     def __exit__(self, *exc: object) -> None:
         self.closing.set()
-        for thread in self._threads:
+        deadline = time.monotonic() + 5.0
+        active = [thread for thread in self._threads if thread.is_alive()]
+        for thread in active:
+            thread.join(timeout=max(0.0, deadline - time.monotonic()))
+        for thread in active:
             if thread.is_alive():
-                thread.join(timeout=5.0)
-        for workers in self.stop_workers.values():
-            workers.shutdown(wait=False, cancel_futures=True)
-        for runtime in self.runtimes.values():
-            runtime.close()
+                log.error("%s did not finish stopping at shutdown. Waiting before releasing its backend.", thread.name)
+        for thread in active:
+            thread.join()
+        for workers in [*self.stop_workers.values(), *self.end_workers.values()]:
+            workers.shutdown(cancel_futures=True)
 
     def _control(self, runtime: Runtime) -> None:
         """One thread per robot calls tick() at the backend's period. Nothing else commands the backend."""
         due = time.monotonic()
-        while not self.closing.is_set():
-            try:
-                runtime.tick()
-            except Exception:
-                log.exception("control tick failed for %s", runtime.robot_id)
-            due += runtime.period_s
-            wait = due - time.monotonic()
-            if wait > 0:
-                self.closing.wait(wait)
-            else:
-                due = time.monotonic()  # overran: resume from now instead of ticking in a burst
+        try:
+            while not self.closing.is_set():
+                try:
+                    runtime.tick()
+                except Exception:
+                    log.exception("control tick failed for %s", runtime.robot_id)
+                due += runtime.period_s
+                wait = due - time.monotonic()
+                if wait > 0:
+                    self.closing.wait(wait)
+                else:
+                    due = time.monotonic()  # overran: resume from now instead of ticking in a burst
+        finally:
+            runtime.close()
 
     def principal(self, authorization: str | None) -> Principal:
         scheme, _, presented = (authorization or "").partition(" ")
@@ -212,7 +226,7 @@ def create_app(service: Service) -> FastAPI:
         An observation keeps a shared worker for as long as its cameras take, and enough of them at once
         occupy every one. A stop, a cancellation, or a closure must not wait for a worker to come free.
         """
-        workers = service.stop_workers[runtime.robot_id]
+        workers = service.end_workers[runtime.robot_id]
         return await asyncio.get_running_loop().run_in_executor(workers, call, *arguments)
 
     @app.exception_handler(RobotError)
@@ -396,7 +410,11 @@ def create_app(service: Service) -> FastAPI:
     @robot.post("/stop", status_code=202)
     async def stop(runtime: Robot, principal: Caller, authority: Authority | None = None) -> Operation:
         # An operator who stops outside a session has no authority to state, so the body may be left out.
-        return await ending(runtime, runtime.stop, principal, authority or Authority())
+        # A cancellation or closure can be reading a historical result from disk.
+        workers = service.stop_workers[runtime.robot_id]
+        return await asyncio.get_running_loop().run_in_executor(
+            workers, runtime.stop, principal, authority or Authority()
+        )
 
     @robot.post("/management", status_code=202)
     def manage(runtime: Robot, principal: Caller, request: ManagementRequest) -> Operation:
@@ -549,6 +567,7 @@ def serve(
     host: str = "127.0.0.1",
     port: int = 0,
     log_level: str = "warning",
+    demo_attempt: str | None = None,
 ) -> None:
     """Run a service in this process until it is interrupted or terminated.
 
@@ -561,23 +580,24 @@ def serve(
     # backend's child process behind. (uvicorn shuts down gracefully on SIGTERM, then re-raises it.)
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
     limits = ServiceLimits()
-    boot_id = "boot-" + secrets.token_hex(8)
+    boot_id = demo_attempt or "boot-" + secrets.token_hex(8)
     record = home / "service.json"
-    home.mkdir(parents=True, exist_ok=True)
-    # Holding the journal is what makes this service the home's only one, so it is taken before anything
-    # else: every later failure then belongs to a service that did own the home.
-    try:
-        journal = Journal(home / "journal.sqlite", boot_id, quota=limits.journal_quota)
-    except JournalInUse:
-        try:
-            running = json.loads(record.read_text())
-            owner = f"the service at {running['url']} (pid {running['pid']})"
-        except OSError, ValueError, KeyError:  # no record: its owner is still starting, or is not a service
-            owner = "another process"
-        raise HomeInUse(f"service home {home} is in use by {owner}") from None
-    # Each of these is released when its block ends, the last one built first, however the block ends: an error
-    # while starting, an interrupt, or termination.
-    with journal, socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener, contextlib.ExitStack() as robots:
+    with contextlib.ExitStack() as resources:
+        with lock_directory(home.parent):
+            if demo_attempt is not None and DemoStart.read(home) != DemoStart(demo_attempt, os.getpid()):
+                raise StartupError("the demo was stopped while it was starting")
+            home.mkdir(parents=True, exist_ok=True)
+            # Demo cleanup holds the parent lock while it checks and removes the service home.
+            try:
+                journal = resources.enter_context(Journal(home / "journal.sqlite", boot_id, quota=limits.journal_quota))
+            except JournalInUse:
+                try:
+                    running = json.loads(record.read_text())
+                    owner = f"the service at {running['url']} (pid {running['pid']})"
+                except OSError, ValueError, KeyError:
+                    owner = "another process"
+                raise HomeInUse(f"service home {home} is in use by {owner}") from None
+        listener = resources.enter_context(socket.socket(socket.AF_INET, socket.SOCK_STREAM))
         record.unlink(missing_ok=True)  # left by a service that was killed; this one writes its own when ready
         # Bind before the tokens are written or a backend starts, so an unusable address fails early.
         listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -596,7 +616,7 @@ def serve(
         url = f"http://{host}:{listener.getsockname()[1]}"
         backends = load_backends(backend, backend_options)
         for robot in backends.values():
-            robots.enter_context(robot)
+            resources.enter_context(robot)
         runtimes = {
             rid: Runtime(rid, robot, journal, boot_id=boot_id, limits=limits) for rid, robot in backends.items()
         }

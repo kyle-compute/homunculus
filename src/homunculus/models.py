@@ -10,9 +10,10 @@ runtime's ``host_monotonic`` clock, whose epoch is the ``boot_id``.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, SerializeAsAny, WithJsonSchema
 
 PROTOCOL = "v1"
 
@@ -90,6 +91,8 @@ class ErrorInfo(Model):
 # --------------------------------------------------------------------------
 # Motion profiles: one action type per profile. The profile name carries its
 # major version; a different version is a different, unsupported profile.
+# profiles.py registers each one; a profile defined elsewhere is registered
+# there the same way.
 # --------------------------------------------------------------------------
 
 
@@ -168,10 +171,34 @@ class ToolPoseGoal(Model):
     after: Literal["hold"] = "hold"
 
 
-Action = Annotated[
-    BaseVelocityGoal | JointTrajectoryGoal | HandPostureGoal | GripperWidthGoal | ToolPoseGoal,
-    Field(discriminator="profile"),
-]
+class UnregisteredProfile(Model):
+    """A request or limits of a profile this process has not registered, kept as it came: a client can then show
+    a robot whose backend added profiles of its own. The runtime refuses a request for one as unsupported_profile.
+    """
+
+    model_config = ConfigDict(extra="allow")
+    profile: str
+
+
+def _by_profile(part: Literal["action", "limits"]) -> Callable[[Any], Any]:
+    """Parse a request or a binding's limits as the model its profile registered (see profiles.register), so a
+    new profile needs no change in this module."""
+
+    def parse(value: Any) -> Any:
+        from .profiles import PROFILES  # read when parsing: profiles.py builds on this module
+
+        name = value.get("profile") if isinstance(value, dict) else getattr(value, "profile", None)
+        if name not in PROFILES:
+            return value if isinstance(value, Model) else UnregisteredProfile.model_validate(value)
+        model = getattr(PROFILES[name], part)
+        return value if isinstance(value, model) else model.model_validate(value)
+
+    return parse
+
+
+_PROFILE_SCHEMA = {"type": "object", "properties": {"profile": {"type": "string"}}, "required": ["profile"]}
+# One finite request of any registered profile; its `profile` field names which.
+Action = Annotated[SerializeAsAny[Model], BeforeValidator(_by_profile("action")), WithJsonSchema(_PROFILE_SCHEMA)]
 
 
 # --------------------------------------------------------------------------
@@ -274,9 +301,9 @@ class ToolPoseLimits(Model):
     max_settle_wait_s: float  # after the segment ends; a pose not reached by then fails the goal
 
 
+# The limits a binding declares, for any registered profile; their `profile` field names which.
 BindingLimits = Annotated[
-    BaseVelocityLimits | JointTrajectoryLimits | HandPostureLimits | GripperWidthLimits | ToolPoseLimits,
-    Field(discriminator="profile"),
+    SerializeAsAny[Model], BeforeValidator(_by_profile("limits")), WithJsonSchema(_PROFILE_SCHEMA)
 ]
 
 

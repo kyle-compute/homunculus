@@ -28,13 +28,9 @@ from ..models import (
     BaseVelocityLimits,
     BaseVelocityTarget,
     ClockInfo,
-    Contract,
-    GripperWidthGoal,
     GripperWidthLimits,
-    HandPostureGoal,
     HandPostureLimits,
     JointLimit,
-    JointTrajectoryGoal,
     JointTrajectoryLimits,
     ProfileBinding,
     RobotError,
@@ -49,7 +45,7 @@ from ..profiles import (
     WidthJudge,
     sample_trajectory,
 )
-from ..runtime import Backend, BackendFacts, Clock, Feedback, ResourceSpec, SystemClock
+from ..runtime import Backend, BackendFacts, Clock, Feedback, GoalCommand, ResourceSpec, SystemClock
 
 NOTICE = "Fake robot: deterministic kinematics with no physics and no robot. Results are protocol evidence only."
 PERIOD_S = 0.02
@@ -278,6 +274,8 @@ def robots() -> dict[str, Backend]:
 
 
 class FakeBackend(Backend):
+    reports_goal_samples = True
+
     def __init__(self, robot: str, clock: Clock):
         if robot not in ROBOTS:
             raise ValueError(f"unknown fake robot {robot!r}; choose from {sorted(ROBOTS)}")
@@ -330,20 +328,10 @@ class FakeBackend(Backend):
             period_s=PERIOD_S,
         )
 
-    def apply(self, activity_id: str, contract: Contract) -> None:
+    def apply(self, activity_id: str, contract: GoalCommand) -> None:
         group = self._groups[contract.resources[0]]
-        action, limits = contract.action, contract.limits
-        self.effects.append(("apply", activity_id, action.profile, group.spec.id))
-        judge: _Judge
-        if isinstance(action, JointTrajectoryGoal):
-            judge = TrajectoryJudge(action, limits)
-        elif isinstance(action, GripperWidthGoal):
-            judge = WidthJudge(action, limits)
-        elif isinstance(action, HandPostureGoal):
-            judge = PostureJudge(action, limits)
-        else:
-            judge = VelocityJudge(action, limits, self._time, _pose(group), action.duration_s)
-        group.motion = _Motion(activity_id, self._time, judge)
+        self.effects.append(("apply", activity_id, contract.action.profile, group.spec.id))
+        group.motion = _Motion(activity_id, self._time, contract.judge)
 
     def track(self, activity_id: str, target: str, setpoint: BaseVelocityTarget, limits: BaseVelocityLimits) -> None:
         # Every target of the fake is its own resource.

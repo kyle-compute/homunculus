@@ -6,20 +6,19 @@ Serve it from this directory with:
 
 Copy this file to start a backend for your robot. Keep describe() honest about what the
 robot can do, send your robot its commands where _command() moves the simulated lift,
-and read your robot's measurements where advance() reads the lift's. Success is not this
-file's to decide: advance() hands the measurements to the profile's judge and reports
-what it says.
+and read your robot's measurements where advance() reads the lift's. The runtime supplies
+the judge that uses those measurements to decide when the goal is met.
 """
 
 from __future__ import annotations
 
 from collections.abc import Sequence
+from dataclasses import dataclass
 from typing import Any
 
 from homunculus.models import (
     BackendInfo,
     ClockInfo,
-    Contract,
     JointLimit,
     JointTrajectoryLimits,
     ProfileBinding,
@@ -27,7 +26,7 @@ from homunculus.models import (
     SensorInfo,
 )
 from homunculus.profiles import TrajectoryJudge, sample_trajectory
-from homunculus.runtime import Backend, BackendFacts, Clock, Feedback, ResourceSpec, SystemClock
+from homunculus.runtime import Backend, BackendFacts, Clock, Feedback, GoalCommand, ResourceSpec, SystemClock
 
 LIMITS = JointTrajectoryLimits(
     profile="joints.trajectory/1",
@@ -50,7 +49,16 @@ def robots(gain: str = "20") -> dict[str, Backend]:
     return {"lift": Lift(SystemClock(), gain=float(gain))}
 
 
+@dataclass
+class _LiftGoal:
+    id: str
+    judge: TrajectoryJudge
+    started_s: float
+
+
 class Lift(Backend):
+    reports_goal_samples = True
+
     def __init__(self, clock: Clock, gain: float):
         self.clock = clock
         self.gain = gain  # how hard the simulated motor pulls toward its reference, per second
@@ -58,8 +66,7 @@ class Lift(Backend):
         self.time = 0.0  # execution time since the lift started
         self.position = self.velocity = self.reference = 0.0
         self.still_for = 0.0  # how long the lift has been measured standing still
-        # The running goal: its id, its judge (which holds the action), and when it started.
-        self.goal: tuple[str, TrajectoryJudge, float] | None = None
+        self.goal: _LiftGoal | None = None
 
     def describe(self) -> BackendFacts:
         return BackendFacts(
@@ -96,8 +103,8 @@ class Lift(Backend):
             period_s=0.01,
         )
 
-    def apply(self, activity_id: str, contract: Contract) -> None:
-        self.goal = (activity_id, TrajectoryJudge(contract.action, contract.limits), self.time)
+    def apply(self, activity_id: str, contract: GoalCommand) -> None:
+        self.goal = _LiftGoal(activity_id, contract.judge, self.time)
 
     def stop(self, resources: Sequence[str]) -> None:
         """The fallback: drop the goal and hold where the lift is measured to be."""
@@ -111,8 +118,8 @@ class Lift(Backend):
         now = self.clock.now()
         dt, self.last = now - self.last, now
         if self.goal is not None:
-            _, judge, started = self.goal
-            (self.reference,), _ = sample_trajectory(judge.action.points, self.time + dt - started)
+            goal = self.goal
+            (self.reference,), _ = sample_trajectory(goal.judge.action.points, self.time + dt - goal.started_s)
         self._command(dt)
         self.time += dt
         self.still_for = self.still_for + dt if abs(self.velocity) <= LIMITS.settle_velocity else 0.0
@@ -134,9 +141,9 @@ class Lift(Backend):
             holding={"lift": {"lift": self.reference}},
         )
         if self.goal is not None:
-            activity_id, judge, started = self.goal
-            status = judge.update(self.time - started, [self.position], [self.velocity], dt)
-            feedback.activities[activity_id] = status
+            goal = self.goal
+            status = goal.judge.update(self.time - goal.started_s, [self.position], [self.velocity], dt)
+            feedback.activities[goal.id] = status
             if status.phase in ("done", "failed"):  # reported once; the reference stays as the hold
                 self.goal = None
         return feedback

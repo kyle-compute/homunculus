@@ -687,18 +687,23 @@ does. The module must be importable: installed, or on `PYTHONPATH`.
 | `describe()` | Declares resources, the profiles each target takes with its limits and tolerances, sensors, clocks, management operations, and the control period. The runtime refuses whatever is not declared here. |
 | `apply(id, contract)` | Starts a goal. `contract.action` is the request with every setting resolved; `contract.limits` is your binding's. |
 | `stop(resources)` | The fallback: end motion and hold where the joints are measured to be. |
-| `advance()` | Reads, or steps, the robot. Returns one `Sample` per resource with `positions` and `velocities` maps, each running goal's status, which resources are measured at rest, and what each holds. |
+| `advance()` | Reads or steps the robot. Returns one `Sample` per resource with `positions` and `velocities` maps, each running goal's controller status, the resources measured at rest, and what each holds. |
 | `track`, `capture`, `manage`, `close` | Needed only for what `describe()` advertises: a stream, a camera, a management operation, something to release. |
 
 Rules a backend keeps:
 
-- Success is not the backend's to decide. In `apply()`, make the profile's
-  judge from `homunculus.profiles` (`TrajectoryJudge`, `WidthJudge`,
-  `PostureJudge`, `VelocityJudge`); in `advance()`, give it what was measured
-  and report what it returns. Every backend then succeeds and fails by the same
-  rules and reports the same measurements.
+- The runtime verifies completion with the profile's judge, which checks
+  measurements against the requested motion. For a backend that reads once per
+  control tick, the runtime feeds the judge from `advance()`. For a backend that
+  reads or steps more often, set `reports_goal_samples = True`. Then `apply()`
+  receives a `GoalCommand` with `contract.judge`. Feed that judge each measured
+  step, as in `examples/lift.py` and `backends/mujoco.py`. Report `done` once
+  the controller has finished issuing commands for that goal. Success requires
+  both the controller's completion and the judge's measured result.
 - `advance()` returns promptly. A backend that waits on its robot does that in
-  a worker thread of its own, as `backends/task.py` does.
+  a worker thread of its own, as `backends/task.py` does. A management operation
+  that waits for a worker can return a `Future` so the control loop can still
+  deliver stops.
 - A problem found while starting is a `StartupError` with a message for the
   person who started the service.
 - `close()` releases what the backend holds, such as a process or a
@@ -723,14 +728,34 @@ Rules a backend keeps:
   in a format browsers show, such as JPEG. Leave `video_fps` out for a camera
   whose captures are costly or counted.
 
-A new kind of motion is a new profile: its goal and limits models in
-`models.py` (added to the `Action` and `BindingLimits` unions), its admission
-rules in `profiles.resolve_action` (and in `stated_duration_s`, if a request
-states how long its motion takes), and its judge in `profiles.py`. The
-runtime, the service, and the client stay as they are. `homunculus describe` lists
-the new profile's limits as its binding declares them, and `homunculus goal submit
---file` sends its goals. A `homunculus goal` command of its own, and a shorter
-layout for its limits in `_limit_rows`, are optional additions to `cli.py`.
+A new kind of motion is a new profile, written in one place, in your own
+module or package: a `profiles.Profile` passed to `profiles.register()`. It
+names the profile (for example `gripper.grasp/1`) and holds:
+
+- `action` and `limits`: the request and what a binding declares, as
+  `models.Model` subclasses whose `profile` field is `Literal` of that name.
+- `resolve(action, limits)`: refuse what the limits do not allow, and return
+  the request with every setting concrete.
+- `judge(action, limits, reading)`: a judge for one activation, a
+  `profiles.MotionJudge` whose `update` is decorated with `@profiles.measures`.
+- `measure(judge, reading)`: feed the judge one newer measurement. Each
+  `profiles.Reading` carries the resource's sample values and the time since
+  activation.
+- Optionally `activate`, to bind a request to the measured start (as a
+  trajectory does), and `duration_s`, if a request states how long its
+  motion takes.
+
+Register it before the service starts, for example in the module that defines
+your backend; a backend that binds a profile no one registered does not start.
+A backend then binds it like any other profile. A client that has not
+registered it still describes the robot, showing its requests and limits as
+sent. The runtime,
+the service, the client and `homunculus goal submit --file` look it up by name,
+and `homunculus describe` lists its limits as its binding declares them. A
+`homunculus goal` command of its own, and a shorter layout for its limits in
+`_limit_rows`, are optional additions to `cli.py`. The
+`test_a_profile_registered_outside_homunculus_...` test in
+`tests/test_contract.py` is a whole example.
 
 ## Python client
 

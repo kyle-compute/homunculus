@@ -42,7 +42,7 @@ import tempfile
 import threading
 from collections.abc import Sequence
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path
 from typing import Any
@@ -59,7 +59,6 @@ from ..models import (
     BackendInfo,
     CameraImage,
     ClockInfo,
-    Contract,
     Goal,
     GoalSubmit,
     GripperWidthGoal,
@@ -82,6 +81,7 @@ from ..runtime import (
     Clock,
     Feedback,
     Frame,
+    GoalCommand,
     Principal,
     ResourceSpec,
     Runtime,
@@ -178,7 +178,6 @@ class _Motion:
     started: float
     columns: list[int]  # which of the group's joints the action commands
     judge: TrajectoryJudge | WidthJudge  # holds the goal's action and limits
-    status: ActivityStatus = field(default_factory=lambda: ActivityStatus("executing"))
 
 
 @dataclass
@@ -201,6 +200,8 @@ class _Group:
 
 
 class MujocoBackend(Backend):
+    reports_goal_samples = True
+
     def __init__(self, clock: Clock, folder: Path):
         """`folder` is a rig: rig.toml and the model it names."""
         rig = rigs.load(folder)
@@ -443,15 +444,14 @@ class MujocoBackend(Backend):
             period_s=PERIOD_S,
         )
 
-    def apply(self, activity_id: str, contract: Contract) -> None:
+    def apply(self, activity_id: str, contract: GoalCommand) -> None:
         group = self._groups[contract.resources[0]]
-        action, limits = contract.action, contract.limits
-        judge: TrajectoryJudge | WidthJudge
+        action = contract.action
         if isinstance(action, JointTrajectoryGoal):
-            columns, judge = [group.spec.joints.index(name) for name in action.joints], TrajectoryJudge(action, limits)
+            columns = [group.spec.joints.index(name) for name in action.joints]
         else:
-            columns, judge = list(range(len(group.spec.joints))), WidthJudge(action, limits)
-        group.motion = _Motion(activity_id, self._data.time, columns, judge)
+            columns = list(range(len(group.spec.joints)))
+        group.motion = _Motion(activity_id, self._data.time, columns, contract.judge)
 
     def stop(self, resources: Sequence[str]) -> None:
         for rid in resources:
@@ -569,8 +569,9 @@ class MujocoBackend(Backend):
                 values=values,
             )
             if group.motion is not None:
-                feedback.activities[group.motion.activity_id] = group.motion.status
-                if group.motion.status.phase == "done":
+                status = group.motion.judge.status or ActivityStatus("executing")
+                feedback.activities[group.motion.activity_id] = status
+                if status.phase == "done":
                     group.motion = None  # the reference it reached stays in place as the hold
             feedback.stopped[rid] = group.motion is None and group.still_for >= group.settle_time_s
             feedback.holding[rid] = dict(zip(names, group.reference.tolist(), strict=True))
@@ -582,7 +583,8 @@ class MujocoBackend(Backend):
         positions, velocities = data.qpos[group.qpos], data.qvel[group.dof]
         rates = np.zeros(len(group.reference))
         motion = group.motion
-        if motion is not None and motion.status.phase in ("executing", "finishing"):
+        status = motion.judge.status if motion is not None else None
+        if motion is not None and (status is None or status.phase in ("executing", "finishing")):
             judge = motion.judge
             if isinstance(judge, TrajectoryJudge):
                 # joints.trajectory/1: follow the validated path.
@@ -590,8 +592,8 @@ class MujocoBackend(Backend):
                 reference, wanted = sample_trajectory(judge.action.points, elapsed)
                 columns = motion.columns
                 group.reference[columns] = reference
-                motion.status = judge.update(elapsed, positions[columns].tolist(), velocities[columns].tolist(), step)
-                if motion.status.phase != "failed":
+                status = judge.update(elapsed, positions[columns].tolist(), velocities[columns].tolist(), step)
+                if status.phase != "failed":
                     rates[columns] = wanted
             else:
                 # gripper.width/1: walk every finger's reference toward an equal share of the gap.
@@ -599,7 +601,7 @@ class MujocoBackend(Backend):
                 share = group.low + (judge.action.width_m - group.low.sum()) / fingers
                 reach = judge.limits.speed_m_s / fingers * step
                 group.reference += np.clip(share - group.reference, -reach, reach)
-                motion.status = judge.update(float(positions.sum()), step)
+                judge.update(float(positions.sum()), step)
         # Each actuator's force is gain*ctrl + bias0 + bias1*length + bias2*velocity. This ctrl turns it into a
         # spring and damper on the error from the reference length and velocity, so the damping acts on the
         # velocity error instead of on the motion itself.
@@ -680,6 +682,7 @@ def check(folder: Path, images: Path) -> list[Step]:
             for _ in range(round(seconds / PERIOD_S)):
                 clock.t += PERIOD_S
                 runtime.tick()
+                journal.flush()
 
         def positions() -> dict[str, float]:
             return runtime.observe().samples["arm"].values["positions"]

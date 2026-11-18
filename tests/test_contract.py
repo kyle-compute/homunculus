@@ -8,6 +8,7 @@ evidence about the protocol; it says nothing about physics or a real robot.
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import io
 import itertools
 import json
@@ -18,17 +19,20 @@ import sys
 import threading
 import time
 from collections.abc import Callable, Iterator
+from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import ExitStack, contextmanager
 from pathlib import Path
+from typing import Literal
 
 import anyio.to_thread
 import httpx
 import pytest
 import uvicorn
-from pydantic import ValidationError
+from pydantic import Field, ValidationError
 
-from homunculus import rigs
+from homunculus import journal, rigs, server
 from homunculus.backends.fake import FakeBackend
+from homunculus.backends.task import TaskBackend, _start_simulator
 from homunculus.cli import main as cli_main
 from homunculus.client import ClientError, RobotClient, Target, TargetStore
 from homunculus.journal import Journal, JournalInUse, held
@@ -44,8 +48,10 @@ from homunculus.models import (
     HandPostureGoal,
     JointTrajectoryGoal,
     ManagementRequest,
+    Model,
     Observation,
     Pose,
+    ProfileBinding,
     RobotError,
     SensorInfo,
     ServiceLimits,
@@ -53,11 +59,21 @@ from homunculus.models import (
     StartConditions,
     StreamOpen,
     StreamUpdate,
+    ToolPoseGoal,
     TrajectoryPoint,
     ValidateRequest,
     VideoLink,
 )
-from homunculus.profiles import VelocityJudge, sample_trajectory
+from homunculus.profiles import (
+    PROFILES,
+    ActivityStatus,
+    MotionJudge,
+    Profile,
+    VelocityJudge,
+    measures,
+    register,
+    sample_trajectory,
+)
 from homunculus.runtime import Backend, BackendFacts, Clock, Frame, Principal, Runtime, StartupError
 from homunculus.server import Service, create_app, load_backends, serve
 
@@ -140,6 +156,7 @@ class Harness:
         for _ in range(round(seconds / STEP)):
             self.clock.t += STEP
             self.runtime.tick()
+            self.journal.flush()
 
     def effects(self, kind: str) -> list[tuple]:
         return [effect for effect in self.backend.effects if effect[0] == kind]
@@ -615,6 +632,172 @@ def test_a_stop_is_sent_until_it_is_delivered_and_asking_again_does_not_restart_
     assert arm.resource("arm").condition == "ready"
 
 
+def test_a_lost_goal_acknowledgement_keeps_the_arm_reserved_until_it_stops(arm, monkeypatch):
+    apply = arm.backend.apply
+
+    def loses_reply(*args):
+        apply(*args)
+        raise ConnectionError("goal delivered without an acknowledgement")
+
+    monkeypatch.setattr(arm.backend, "apply", loses_reply)
+    arm.open()
+    goal = arm.submit(reach(joint1=1.0, at=2.0))
+    assert arm.finish(goal, 2 * STEP).state == "stopping"
+    assert arm.resource("arm").activity == goal.goal_id
+    assert arm.effects("stop") == [("stop", ("arm",))]
+    assert refused(lambda: arm.submit(reach(joint1=0.5))) == "resource_busy"
+
+    goal = arm.finish(goal, 0.5)
+    assert (goal.state, goal.result.reason, goal.result.stop_confirmed) == ("failed", "backend_error", True)
+    assert arm.runtime.observe().samples["arm"].values["positions"]["joint1"] == 0.0
+
+
+def test_a_lost_first_stream_acknowledgement_stops_without_claiming_delivery(g1, monkeypatch):
+    track = g1.backend.track
+
+    def loses_reply(*args):
+        track(*args)
+        raise ConnectionError("target delivered without an acknowledgement")
+
+    monkeypatch.setattr(g1.backend, "track", loses_reply)
+    g1.open()
+    stream = g1.open_stream(0.3)
+    g1.run(2 * STEP)
+    live = g1.runtime.stream(stream.stream_id)
+    assert (live.state, live.applied_sequence) == ("stopping", None)
+    assert g1.effects("stop") == [("stop", ("base",))]
+    g1.run(0.5)
+    closed = g1.runtime.stream(stream.stream_id)
+    assert (closed.state, closed.closure, closed.applied_sequence) == ("closed", "failed", None)
+    assert g1.runtime.observe().samples["base"].values["positions"]["x_m"] == 0.0
+
+
+def test_a_command_is_never_sent_without_its_durable_dispatch_marker(arm, monkeypatch):
+    record = arm.journal.record
+
+    def refuse_marker(*args, finished):
+        if not finished:
+            raise OSError("injected journal write failure")
+        record(*args, finished=finished)
+
+    monkeypatch.setattr(arm.journal, "record", refuse_marker)
+    arm.open()
+    goal = arm.finish(arm.submit(reach(joint1=1.0, at=2.0)), 0.1)
+    assert (goal.state, goal.result.reason, goal.activated_time_ns) == ("failed", "journal_error", None)
+    assert arm.effects("apply") == arm.effects("stop") == []
+
+
+def test_a_stop_is_sent_while_the_outcome_of_another_move_cannot_be_saved(g1, monkeypatch, caplog):
+    # This driver supports base and hand work at the same time.
+    g1.runtime._facts.concurrent = [["base", "left_hand"]]
+    g1.open()
+    stream = g1.open_stream(0.3)
+    g1.run(0.1)
+    queued = g1.submit(posture("fist"))
+    writing, release = threading.Event(), threading.Event()
+    record = g1.journal.record
+
+    def held_write(robot_id, operation_id, document, *, finished):
+        if operation_id == queued.goal_id:
+            writing.set()
+            assert release.wait(5)
+            raise OSError("injected journal write failure")
+        record(robot_id, operation_id, document, finished=finished)
+
+    monkeypatch.setattr(g1.journal, "record", held_write)
+    stop = g1.runtime.stop(OPERATOR, Authority())
+    try:
+        assert writing.wait(5)
+        g1.clock.t += STEP
+        g1.runtime.tick()
+        assert g1.effects("stop") == [("stop", ("base", "left_hand"))]
+    finally:
+        release.set()
+    g1.run(0.5)
+    assert g1.runtime.operation(stop.operation_id).state == "succeeded"
+    assert g1.runtime.stream(stream.stream_id).state == "closed"
+    assert g1.runtime.goal(queued.goal_id).state == "cancelled"
+    assert queued.goal_id in caplog.text and "injected journal write failure" in caplog.text
+
+
+def test_a_stop_invalidates_a_move_whose_admission_write_is_still_in_progress(arm, monkeypatch):
+    arm.open()
+    writing, release = threading.Event(), threading.Event()
+    admit = arm.journal.admit
+
+    def held_write(**request):
+        writing.set()
+        assert release.wait(5)
+        admit(**request)
+
+    monkeypatch.setattr(arm.journal, "admit", held_write)
+    with ThreadPoolExecutor() as worker:
+        goal_reply = worker.submit(arm.submit, reach(joint1=1.0, at=2.0))
+        try:
+            assert writing.wait(5)
+            stop = arm.runtime.stop(OPERATOR, Authority())
+            arm.run(0.5)
+            assert arm.runtime.operation(stop.operation_id).state == "succeeded"
+        finally:
+            release.set()
+        goal = goal_reply.result(timeout=5)
+    arm.run(0.5)
+    assert (goal.state, goal.result.reason) == ("cancelled", "stopped")
+    assert arm.effects("apply") == []
+
+
+def test_shutdown_stops_the_other_robot_while_one_driver_is_stalled(arm, tmp_path, monkeypatch):
+    with Harness(tmp_path / "second.sqlite", "g1") as g1:
+        blocked, release, leave, stopped = (threading.Event() for _ in range(4))
+        stop = g1.backend.stop
+
+        def stalled_tick():
+            blocked.set()
+            assert release.wait(5)
+
+        def report_stop(resources):
+            stop(resources)
+            stopped.set()
+
+        monkeypatch.setattr(arm.runtime, "tick", stalled_tick)
+        monkeypatch.setattr(g1.backend, "stop", report_stop)
+        service = Service({"arm": arm.runtime, "g1": g1.runtime}, {}, "boot", ServiceLimits())
+
+        def serve_until_requested():
+            with service:
+                assert leave.wait(5)
+
+        with ThreadPoolExecutor() as worker:
+            shutdown = worker.submit(serve_until_requested)
+            try:
+                assert blocked.wait(5)
+                leave.set()
+                assert stopped.wait(2)
+                assert not shutdown.done()
+            finally:
+                leave.set()
+                release.set()
+            shutdown.result(timeout=5)
+
+
+@pytest.mark.parametrize("device_cadence", [True, False])
+def test_a_drivers_done_report_without_measured_completion_fails(arm, monkeypatch, device_cadence):
+    arm.open()
+    goal = arm.submit(reach(joint1=1.0, at=2.0))
+    advance = arm.backend.advance
+
+    def premature_completion():
+        feedback = advance()
+        feedback.activities[goal.goal_id] = ActivityStatus("done")
+        return feedback
+
+    monkeypatch.setattr(arm.backend, "reports_goal_samples", device_cadence)
+    monkeypatch.setattr(arm.backend, "apply", lambda *_: None)
+    monkeypatch.setattr(arm.backend, "advance", premature_completion)
+    goal = arm.finish(goal, 0.5)
+    assert (goal.state, goal.result.reason, goal.result.stop_confirmed) == ("failed", "completion_unverified", True)
+
+
 # --------------------------------------------------------------------------
 # Stopping that cannot be confirmed
 # --------------------------------------------------------------------------
@@ -772,7 +955,11 @@ def test_a_restart_interrupts_unfinished_goals_and_never_replays_them(arm):
 
 @pytest.mark.parametrize(
     "ticked, applied, said",
-    [(0.1, 0, "targets were dispatched"), (0.0, None, "no target had been dispatched")],
+    [
+        (0.1, 0, "targets were dispatched"),
+        (STEP, None, "a target may have been dispatched"),
+        (0.0, None, "no target had been dispatched"),
+    ],
 )
 def test_a_restart_reports_whether_an_interrupted_stream_had_commanded_motion(g1, ticked, applied, said):
     g1.open()
@@ -780,7 +967,7 @@ def test_a_restart_reports_whether_an_interrupted_stream_had_commanded_motion(g1
     g1.run(ticked)  # with no tick, the process dies before the controller sees the target
     g1.boot()
     stream = g1.runtime.stream(stream.stream_id)
-    # Only a stream's first dispatch is journalled. That is enough to tell "may have moved" from "never did".
+    # The first dispatch is recorded before the send, and the acknowledgement is recorded separately.
     assert (stream.state, stream.closure, stream.applied_sequence) == ("closed", "interrupted", applied)
     assert said in stream.detail
 
@@ -952,6 +1139,37 @@ def test_requests_that_end_motion_are_answered_while_every_shared_worker_is_busy
     assert arm.runtime.goal(moving.goal_id).result.stop_confirmed
 
 
+def test_the_http_stop_worker_is_available_during_historical_journal_reads(arm, monkeypatch):
+    service = Service({"fake-arm": arm.runtime}, {"operator-token": OPERATOR}, "boot-00000001", ServiceLimits())
+    reads, release = threading.Semaphore(0), threading.Event()
+    find = arm.journal.find
+
+    def held_read(*args):
+        reads.release()
+        assert release.wait(5)
+        return find(*args)
+
+    monkeypatch.setattr(arm.journal, "find", held_read)
+
+    async def request_stop():
+        transport = httpx.ASGITransport(app=create_app(service))
+        headers = {"Authorization": "Bearer operator-token"}
+        async with httpx.AsyncClient(transport=transport, base_url="http://service", headers=headers) as http:
+            robot = "/v1/robots/fake-arm"
+            pending = [asyncio.create_task(http.post(f"{robot}/goals/goal-retired-{i}/cancel")) for i in range(2)]
+            try:
+                for _ in pending:
+                    assert await asyncio.to_thread(reads.acquire, timeout=5)
+                stop = await asyncio.wait_for(http.post(f"{robot}/stop"), timeout=2)
+                assert stop.status_code == 202
+            finally:
+                release.set()
+                await asyncio.gather(*pending)
+
+    with service:
+        asyncio.run(request_stop())
+
+
 # --------------------------------------------------------------------------
 # Two robots, one client
 # --------------------------------------------------------------------------
@@ -1081,6 +1299,251 @@ def test_a_service_that_cannot_start_closes_the_backend_it_built(tmp_path, monke
     assert not (home / "service.json").exists() and not held(home / "journal.sqlite")
 
 
+def test_demo_cleanup_holds_off_a_new_service_claim(tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    demo = home / "demo"
+    demo.mkdir(parents=True)
+    old_file = demo / "server.log"
+    old_file.touch()
+    attempted = threading.Event()
+    acquired = threading.Event()
+    monkeypatch.setenv("HOMUNCULUS_HOME", str(home))
+    monkeypatch.setattr(signal, "signal", lambda *_: None)
+
+    class Claimed(Exception):
+        pass
+
+    def journal_claim(*args, **kwargs):
+        assert not old_file.exists()
+        acquired.set()
+        raise Claimed
+
+    monkeypatch.setattr(server, "Journal", journal_claim)
+
+    def contender():
+        attempted.set()
+        with pytest.raises(Claimed):
+            serve("fake", {}, demo)
+
+    with ThreadPoolExecutor() as worker:
+        claim: Future[None] | None = None
+
+        def check_unowned(path):
+            nonlocal claim
+            assert not held(path)
+            claim = worker.submit(contender)
+            assert attempted.wait(5)
+            assert not acquired.is_set()
+            return False
+
+        monkeypatch.setattr(journal, "held", check_unowned)
+        assert cli_main(["demo", "stop"]) == 0
+        assert claim is not None
+        claim.result(timeout=5)
+    assert acquired.is_set()
+
+
+def task_state(*, finished=False):
+    hand = {
+        "position": [0.0, 0.0, 0.8],
+        "quaternion_wxyz": [1.0, 0.0, 0.0, 0.0],
+        "gap_m": 0.05,
+        "requested_opening": 0.5,
+        "touch_normal_force_N": 0.0,
+        "arm_joint_angles": [0.0] * 7,
+        "controller_status": "holding",
+        "finger_joint_angles": {"thumb_0": 0.0},
+    }
+    return {
+        "robot": {
+            "hands": {"left": hand, "right": hand},
+            "base_xy_yaw": [0.0, 0.0, 0.0],
+            "support": {
+                "stable": True,
+                "linear_speed_m_s": 0.0,
+                "angular_speed_rad_s": 0.0,
+                "foot_normal_force_N": 1.0,
+            },
+            "pelvis_height": 0.8,
+            "fallen": False,
+        },
+        "sim_time": 0.0,
+        "finished": finished,
+    }
+
+
+@pytest.mark.parametrize("wait_in_queue", [False, True])
+def test_a_pending_episode_finish_leaves_stops_responsive(tmp_path, monkeypatch, wait_in_queue):
+    entered, release, sent = threading.Event(), threading.Event(), threading.Event()
+
+    def simulator(request):
+        if request.url.path == "/health":
+            return httpx.Response(200, json={"ready": True})
+        if request.method == "POST" and json.loads(request.content)["action"] == "finish":
+            sent.set()
+            entered.set()
+            assert release.wait(5)
+            # The simulator sealed the episode but its reply was lost.
+            raise httpx.ReadTimeout("finish response was lost", request=request)
+        return httpx.Response(200, json=task_state(finished=sent.is_set()))
+
+    transport = httpx.MockTransport(simulator)
+    client = httpx.Client(transport=transport, base_url="http://simulator")
+    monkeypatch.setattr(httpx, "Client", lambda **_: client)
+    with Harness(
+        tmp_path / "journal.sqlite", "task", backend=lambda _: TaskBackend("test", "http://simulator", epoch="test")
+    ) as task:
+        if wait_in_queue:
+
+            def hold_queue():
+                entered.set()
+                assert release.wait(5)
+
+            task.backend._commands.put(hold_queue)
+        command = ManagementRequest(request_id="finish", context_id=task.context, operation="episode.finish")
+        finish = task.runtime.manage(OPERATOR, command)
+        try:
+            task.run(STEP)
+            assert entered.wait(5)
+            stop = task.runtime.stop(OPERATOR, Authority())
+            task.clock.t += 61
+            task.run(STEP)
+            assert task.runtime.operation(stop.operation_id).operation_id == stop.operation_id
+            pending = task.runtime.operation(finish.operation_id)
+            assert pending.state == ("failed" if wait_in_queue else "running")
+        finally:
+            release.set()
+        drained = threading.Event()
+        task.backend._commands.put(drained.set)
+        assert drained.wait(5)
+        # Any confirmation read that was queued after the lost reply is ahead of this second barrier.
+        drained.clear()
+        task.backend._commands.put(drained.set)
+        assert drained.wait(5)
+        task.run(STEP)
+        assert sent.is_set() is not wait_in_queue
+        final = task.runtime.operation(finish.operation_id)
+        if wait_in_queue:
+            assert (final.state, final.reason) == ("failed", "backend_error")
+        else:
+            assert final.state == "succeeded" and final.outcome["finished"]
+
+
+def test_a_both_hands_goal_carries_the_right_hand_rigidly_with_the_left(tmp_path, monkeypatch):
+    state = task_state()
+    hands = state["robot"]["hands"]
+    hands["left"] = {**hands["left"], "position": [0.3, 0.2, 0.9]}
+    hands["right"] = {**hands["right"], "position": [0.3, -0.2, 0.9]}
+    steps = []
+
+    def simulator(request):
+        if request.url.path == "/health":
+            return httpx.Response(200, json={"ready": True})
+        if request.method == "POST":
+            body = json.loads(request.content)
+            steps.append(sorted(body.get("hands", {})))
+            for side, target in body.get("hands", {}).items():  # arms that track their targets exactly
+                hands[side] = {**hands[side], "position": target["position"], "quaternion_wxyz": target["quaternion"]}
+            state["sim_time"] += body.get("seconds", 0.0)
+        return httpx.Response(200, json=state)
+
+    client = httpx.Client(transport=httpx.MockTransport(simulator), base_url="http://simulator")
+    monkeypatch.setattr(httpx, "Client", lambda **_: client)
+    quarter_turn = [0.0, 0.0, math.sin(math.pi / 4), math.cos(math.pi / 4)]  # 90 degrees about +z, xyzw
+    with Harness(
+        tmp_path / "journal.sqlite", "task", backend=lambda _: TaskBackend("test", "http://simulator", epoch="test")
+    ) as task:
+        task.open()
+        action = ToolPoseGoal(
+            profile="tool.pose.linear/1",
+            target="both_hands",
+            position_m=[0.4, 0.2, 1.0],
+            orientation_xyzw=quarter_turn,
+            speed_m_s=0.1,
+        )
+        goal = task.submit(action)
+        deadline = time.monotonic() + 10
+        while (goal := task.runtime.goal(goal.goal_id)).state not in ("succeeded", "failed", "cancelled"):
+            assert time.monotonic() < deadline
+            task.run(STEP)
+            time.sleep(0.002)
+    assert goal.state == "succeeded", goal
+    assert steps and all(sides == ["left", "right"] for sides in steps if sides)
+    # The right hand was 0.4 m to the left hand's -y; a quarter turn about +z puts it 0.4 m to its +x.
+    assert hands["left"]["position"] == pytest.approx([0.4, 0.2, 1.0], abs=1e-9)
+    assert hands["right"]["position"] == pytest.approx([0.8, 0.2, 1.0], abs=1e-9)
+    w, x, y, z = hands["right"]["quaternion_wxyz"]
+    assert [x, y, z, w] == pytest.approx(quarter_turn, abs=1e-9)
+
+
+def test_jaws_stopped_on_an_object_keep_squeezing_when_the_goal_ends(tmp_path, monkeypatch):
+    state = task_state()
+    hands = state["robot"]["hands"]
+    hands["left"] = {**hands["left"], "gap_m": 0.1, "requested_opening": 1.0}
+    openings = []
+
+    def simulator(request):
+        if request.url.path == "/health":
+            return httpx.Response(200, json={"ready": True})
+        if request.method == "POST":
+            body = json.loads(request.content)
+            if body["action"] == "grip":  # the jaws close onto a 5 cm object and stop there
+                hands["left"] = {**hands["left"], "gap_m": 0.05, "requested_opening": body["opening"]}
+            if "openings" in body:
+                openings.append(body["openings"]["left"])
+                hands["left"] = {**hands["left"], "requested_opening": body["openings"]["left"]}
+            state["sim_time"] += body.get("seconds", 0.0)
+        return httpx.Response(200, json=state)
+
+    client = httpx.Client(transport=httpx.MockTransport(simulator), base_url="http://simulator")
+    monkeypatch.setattr(httpx, "Client", lambda **_: client)
+    with Harness(
+        tmp_path / "journal.sqlite", "task", backend=lambda _: TaskBackend("test", "http://simulator", epoch="test")
+    ) as task:
+        task.open()
+        goal = task.submit(GripperWidthGoal(profile="gripper.width/1", target="left_gripper", width_m=0.0))
+        deadline = time.monotonic() + 10
+        while (goal := task.runtime.goal(goal.goal_id)).state not in ("succeeded", "failed", "cancelled"):
+            assert time.monotonic() < deadline
+            task.run(STEP)
+            time.sleep(0.002)
+        drained = threading.Event()
+        task.backend._commands.put(drained.set)
+        assert drained.wait(5)
+    assert goal.state == "failed" and goal.result.reason == "width_not_reached"
+    # The stop that ends the failed goal holds the jaws at the closed request, not at the 5 cm they measure.
+    assert openings and all(opening == 0.0 for opening in openings)
+
+
+@pytest.mark.parametrize("launch_child", [False, True])
+def test_failed_simulator_start_releases_every_open_resource(tmp_path, monkeypatch, launch_child):
+    spawned = []
+
+    @contextmanager
+    def simulator():
+        root = tmp_path / "task"
+        entry = root / "environment" / "simulator" / "start.py"
+        entry.parent.mkdir(parents=True)
+        entry.write_text("import time\ntime.sleep(60)\n")
+        with _start_simulator(root, Path(sys.executable), tmp_path / "episode") as started:
+            process, _ = started
+            spawned.append(process)
+            yield started
+
+    def reply(request):
+        document = {"ready": True} if request.url.path == "/health" else {"robot": {}, "sim_time": 0.0}
+        return httpx.Response(200, json=document)
+
+    client = httpx.Client(transport=httpx.MockTransport(reply), base_url="http://simulator")
+    monkeypatch.setattr(httpx, "Client", lambda **_: client)
+    with pytest.raises(StartupError, match="does not report the robot state"):
+        TaskBackend("test", "http://simulator", epoch="test", simulator=simulator() if launch_child else None)
+    assert client.is_closed
+    if launch_child:
+        (process,) = spawned
+        assert process.returncode is not None
+
+
 def test_a_session_held_for_a_block_is_released_however_the_block_ends(tmp_path, monkeypatch):
     with Harness(tmp_path / "journal.sqlite", "arm") as harness:
         service = Service({"fake-arm": harness.runtime}, {"client-token": CLIENT}, "boot-00000001", ServiceLimits())
@@ -1096,7 +1559,21 @@ def test_a_session_held_for_a_block_is_released_however_the_block_ends(tmp_path,
                 with pytest.raises(RuntimeError, match="in the block"), robot.session():
                     raise RuntimeError("in the block")
                 assert not robot.describe().session.held
-                robot.open_session()  # so nothing refuses it with session_conflict
+                with robot.session() as original:
+                    robot.close_session()
+                    replacement = robot.open_session()
+                assert original.session_id != replacement.session_id
+                assert robot.describe().session.held
+                assert robot.target.session_id == replacement.session_id
+                robot.close_session()
+
+            def fail_save():
+                raise OSError("failed to save the session locally")
+
+            with RobotClient(store.get("fake:arm"), on_change=fail_save) as robot:
+                with pytest.raises(OSError, match="failed to save the session locally"), robot.session():
+                    pytest.fail("the body must not run if saving the acquired session failed")
+                assert not robot.describe().session.held
 
 
 @pytest.mark.parametrize(
@@ -1390,6 +1867,44 @@ def test_two_commands_that_save_in_the_same_instant_both_keep_what_they_learned(
 
     saved = TargetStore(tmp_path).targets
     assert (saved["fake:arm"].session_id, saved["fake:g1"].session_id) == ("ses-arm", "ses-g1")
+
+
+def test_a_late_save_cannot_attach_the_old_robots_session_to_a_replacement(tmp_path, monkeypatch):
+    def robots(*args, **kwargs):
+        return httpx.Response(200, json={"robots": [{"robot_id": "fake-arm"}]})
+
+    monkeypatch.setattr(httpx, "get", robots)
+    first = TargetStore(tmp_path)
+    first.connect("http://old", "example")
+    first.save()
+
+    reconnect = TargetStore(tmp_path)
+    reconnect.connect("http://new", "example")
+    reconnect.save()
+    first.targets["fake:arm"].session_id = "ses-old"
+    first.targets["fake:arm"].context_id = "ctx-old"
+    first.save()
+
+    target = TargetStore(tmp_path).targets["fake:arm"]
+    assert (target.url, target.session_id, target.context_id) == ("http://new", None, None)
+
+
+def test_a_failed_target_save_can_be_retried_on_the_same_store(tmp_path, monkeypatch):
+    store = TargetStore(tmp_path)
+    target = Target(name="fake:arm", url="http://example", robot_id="fake-arm", token="example")
+    store.targets[target.name] = target
+    store.save()
+    target.session_id = "ses-new"
+
+    def fail(*args):
+        raise OSError("injected rename failure")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(Path, "replace", fail)
+        with pytest.raises(OSError, match="injected rename failure"):
+            store.save()
+    store.save()
+    assert TargetStore(tmp_path).get(target.name).session_id == "ses-new"
 
 
 # --------------------------------------------------------------------------
@@ -1742,3 +2257,140 @@ def test_the_simulated_panda_sees_through_its_own_cameras_and_says_where_each_on
     assert moved.image.media_type == "image/jpeg" and moved.data.startswith(b"\xff\xd8")
     assert int(moved.image.capture_time_ns) >= int(observation.images[0].capture_time_ns)
     assert moved.image.clock_epoch == observation.images[0].clock_epoch == panda.runtime.describe().world_id
+
+
+# --------------------------------------------------------------------------
+# A profile added from outside homunculus
+# --------------------------------------------------------------------------
+
+
+class DwellGoal(Model):
+    """A profile homunculus does not ship: keep a resource as it is for a while."""
+
+    profile: Literal["test.dwell/1"]
+    target: str
+    seconds: float = Field(gt=0)
+
+
+class DwellLimits(Model):
+    profile: Literal["test.dwell/1"]
+    max_seconds: float
+    settle_time_s: float = 0.0
+
+
+class DwellJudge(MotionJudge):
+    def __init__(self, seconds: float) -> None:
+        super().__init__()
+        self.seconds = seconds
+
+    @measures
+    def update(self, elapsed_s: float, width_m: float) -> ActivityStatus:
+        if elapsed_s < self.seconds:
+            return ActivityStatus("executing")
+        return ActivityStatus("done", {"dwelled_s": elapsed_s, "width_m": width_m})
+
+
+def _resolve_dwell(action: DwellGoal, limits: DwellLimits) -> DwellGoal:
+    if action.seconds > limits.max_seconds:
+        raise RobotError("limit_exceeded", f"seconds={action.seconds:g} exceeds {limits.max_seconds:g}")
+    return action
+
+
+@pytest.fixture
+def dwell() -> Iterator[Profile]:
+    profile = register(
+        Profile(
+            name="test.dwell/1",
+            action=DwellGoal,
+            limits=DwellLimits,
+            resolve=_resolve_dwell,
+            duration_s=lambda action: action.seconds,
+            judge=lambda action, limits, reading: DwellJudge(action.seconds),
+            measure=lambda judge, reading: judge.update(reading.elapsed_s, reading.values["width_m"]),
+        )
+    )
+    yield profile
+    del PROFILES[profile.name]
+
+
+class DwellingArm(FakeBackend):
+    """The fake arm with test.dwell/1 bound to its gripper; the runtime judges it from the gripper's samples."""
+
+    reports_goal_samples = False
+
+    def __init__(self, clock: Clock) -> None:
+        super().__init__("arm", clock)
+        self.dwells: dict[str, tuple[float, float]] = {}  # activity id -> (started at, seconds)
+
+    def describe(self) -> BackendFacts:
+        facts = super().describe()
+        binding = ProfileBinding(
+            profile="test.dwell/1",
+            target="gripper",
+            role="gripper",
+            resources=["gripper"],
+            modes=["goal"],
+            controller="test_dwell",
+            assistance="none: nothing moves",
+            stop_deadline_wall_s=0.5,
+            limits=DwellLimits(profile="test.dwell/1", max_seconds=5.0),
+        )
+        return dataclasses.replace(facts, bindings=[*facts.bindings, binding])
+
+    def apply(self, activity_id: str, contract) -> None:
+        self.effects.append(("apply", activity_id, contract.action.profile, contract.resources[0]))
+        self.dwells[activity_id] = (self._time, contract.action.seconds)
+
+    def advance(self):
+        feedback = super().advance()
+        for activity_id, (started, seconds) in self.dwells.items():
+            feedback.activities[activity_id] = ActivityStatus(
+                "done" if self._time - started >= seconds else "executing"
+            )
+        return feedback
+
+
+def test_a_profile_registered_outside_homunculus_is_admitted_judged_and_reported(tmp_path, dwell):
+    with Harness(tmp_path / "journal.sqlite", "arm", backend=DwellingArm) as arm:
+        arm.open()
+        assert "test.dwell/1" in [b.profile for b in arm.runtime.describe().profiles]
+        too_long = DwellGoal(profile="test.dwell/1", target="gripper", seconds=9.0)
+        assert refused(lambda: arm.submit(too_long)) == "limit_exceeded"
+
+        goal = arm.submit(DwellGoal(profile="test.dwell/1", target="gripper", seconds=1.0))
+        assert arm.finish(goal, 0.5).state == "executing"
+        goal = arm.finish(goal, 1.0)
+        assert (goal.state, goal.result.reason) == ("succeeded", "completed")
+        assert goal.result.measurements["dwelled_s"] >= 1.0
+        assert goal.result.measurements["width_m"] == pytest.approx(0.08)  # the runtime handed it the gripper's sample
+        assert goal.retained.profile == "test.dwell/1"
+
+
+def test_a_registered_profile_crosses_the_wire_as_its_own_model(dwell):
+    wire = {"profile": "test.dwell/1", "target": "gripper", "seconds": 2.0}
+    spec = GoalSpec.model_validate({"action": wire})
+    assert isinstance(spec.action, DwellGoal)
+    assert GoalSpec.model_validate_json(spec.model_dump_json()) == spec
+    with pytest.raises(ValidationError):
+        GoalSpec.model_validate({"action": {**wire, "seconds": -1.0}})  # the profile's own model still validates
+
+
+def test_a_profile_this_process_never_registered_is_kept_as_sent_and_the_robot_refuses_it(arm):
+    wire = {"profile": "test.nothing/1", "target": "gripper", "grip": 3}
+    spec = GoalSpec.model_validate({"action": wire})
+    assert spec.model_dump(mode="json")["action"] == wire  # a client can still show it
+    arm.open()
+    assert refused(lambda: arm.submit(spec.action)) == "unsupported_profile"
+
+
+def test_a_backend_binding_a_profile_no_one_registered_does_not_start(tmp_path):
+    with pytest.raises(StartupError, match=r"binds test\.dwell/1, which no one registered"):
+        Harness(tmp_path / "journal.sqlite", "arm", backend=DwellingArm)
+
+
+def test_register_refuses_a_name_its_models_do_not_carry_or_one_already_taken(dwell):
+    renamed = dataclasses.replace(dwell, name="test.other/1")
+    with pytest.raises(ValueError, match="must be Literal"):
+        register(renamed)
+    with pytest.raises(ValueError, match="already registered"):
+        register(dwell)

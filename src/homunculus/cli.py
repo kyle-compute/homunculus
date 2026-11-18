@@ -17,6 +17,7 @@ import itertools
 import json
 import math
 import os
+import secrets
 import shutil
 import signal
 import subprocess
@@ -924,6 +925,7 @@ def serve(args: argparse.Namespace) -> int:
             host=args.host,
             port=args.port,
             log_level=args.log_level,
+            demo_attempt=args.demo_attempt,
         )
     except HomeInUse as error:  # exit status NO_SERVICE, which `homunculus demo start` relies on
         raise ClientError(str(error), hint="stop it first, or give this service its own --home") from None
@@ -985,69 +987,99 @@ def _end(process: subprocess.Popen[bytes]) -> None:
         process.wait()
 
 
-def _terminate(pid: int, patience_s: float = 15.0) -> None:
+def _terminate(pid: int, database: Path, patience_s: float = 15.0) -> None:
     """Ask a service another command started to shut down, and wait until it is gone; kill it only if it stays."""
     deadline = time.monotonic() + patience_s
     with suppress(ProcessLookupError):  # raised by the first signal sent after the process is gone
         os.kill(pid, signal.SIGTERM)
         while time.monotonic() < deadline:
-            os.kill(pid, 0)
+            if not journal.held(database):
+                return
             time.sleep(0.05)
-        os.kill(pid, signal.SIGKILL)
+        if journal.held(database):
+            os.kill(pid, signal.SIGKILL)
+    deadline = time.monotonic() + 2.0
+    while journal.held(database):
+        if time.monotonic() >= deadline:
+            raise ClientError(f"process {pid} still holds the demo's journal")
+        time.sleep(0.05)
 
 
 def demo_start(args: argparse.Namespace) -> int:
     store = TargetStore()
     home = store.home / "demo"
-    if _demo_service(home):
-        raise ClientError("the demo service is already running", hint="stop it first with `homunculus demo stop`")
-    store.forget_home(home)
-    # Nothing is deleted before starting: whether these files are in use is for the service to decide, not
-    # this command. What a killed demo left behind is taken over, as on any restart in the same home.
-    home.mkdir(parents=True, exist_ok=True)
+    boot_id = "boot-" + secrets.token_hex(8)
+    claim_file = home / "start.json"
     log_path = home / "server.log"
-    command = [sys.executable, "-m", "homunculus.cli", "serve", "--home", str(home), *_serve_options(args)]
+    command = [
+        sys.executable,
+        "-m",
+        "homunculus.cli",
+        "serve",
+        "--home",
+        str(home),
+        "--demo-attempt",
+        boot_id,
+        *_serve_options(args),
+    ]
     stopped = ClientError(
         "the demo was stopped while it was starting", hint="start it again with `homunculus demo start`"
     )
     deadline = time.monotonic() + args.startup_timeout
-    ready = False
-    # From here on this command owns a service, so being terminated undoes the start as Ctrl-C does.
+    process = None
     signal.signal(signal.SIGTERM, signal.default_int_handler)
-    with open(log_path, "ab") as log_file:
-        logged = log_file.tell()
-        process = subprocess.Popen(
-            command, stdout=log_file, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, start_new_session=True
-        )
     try:
-        while (record := _service_record(home)).get("pid") != process.pid:  # written once that service is ready
+        with journal.lock_directory(home.parent):
+            record, advice = _demo(home)
+            if record or advice:
+                raise ClientError("the demo service is already starting or running", hint=advice)
+            starting = journal.DemoStart.read(home)
+            if starting is not None:
+                try:
+                    os.kill(starting.pid, 0)
+                except ProcessLookupError:
+                    pass
+                else:
+                    raise ClientError("the demo service is already starting")
+            home.mkdir(parents=True, exist_ok=True)
+            with open(log_path, "ab") as log_file:
+                logged = log_file.tell()
+                process = subprocess.Popen(
+                    command, stdout=log_file, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, start_new_session=True
+                )
+            claim = journal.DemoStart(boot_id, process.pid)
+            claim_file.write_text(json.dumps(dataclasses.asdict(claim)))
+
+        while (record := _service_record(home)).get("boot_id") != boot_id:
+            if journal.DemoStart.read(home) != claim:
+                raise stopped
             if process.poll() is not None or time.monotonic() > deadline:
                 problem = "exited during startup" if process.poll() is not None else "did not start in time"
-                _end(process)
                 output = log_path.read_bytes()[logged:].decode(errors="replace")[-2000:].strip()
                 hint = None if output else "allow more time with --startup-timeout"
                 raise ClientError(f"the demo service {problem}" + (f":\n{output}" if output else ""), hint=hint)
             time.sleep(0.05)
-        ready = True
-        added = store.connect_home(home)
-        store.default = added[-1].name
-        store.save()
-        if not log_path.exists() or process.poll() is not None:
-            raise stopped
-    except BaseException as error:
-        # A `homunculus demo stop` during this start removes the demo's files, and ends the service if it is ready.
-        was_stopped = not log_path.exists() or (ready and process.poll() is not None)
-        _end(process)  # never leave a service running that the user was not told about
-        if process.returncode == NO_SERVICE:  # `homunculus serve` was refused the home; these files are not ours
-            raise ClientError(
-                f"a service is already starting or running in the demo's files ({home})",
-                hint="`homunculus demo status` shows it once it is up; `homunculus demo stop` stops it",
-            ) from None
-        store.forget_home(home)
-        shutil.rmtree(home, ignore_errors=True)  # a demo that did not start leaves nothing behind
-        store.save()
-        if was_stopped and isinstance(error, Exception):  # an interrupt stays an interrupt
-            raise stopped from None
+        with journal.lock_directory(home.parent):
+            if journal.DemoStart.read(home) != claim or process.poll() is not None:
+                raise stopped
+            store = TargetStore(home.parent)
+            store.forget_home(home)
+            added = store.connect_home(home)
+            store.default = added[-1].name
+            store._save_locked()
+            claim_file.unlink()
+    except BaseException:
+        if process is not None:
+            _end(process)
+            with journal.lock_directory(home.parent):
+                if journal.DemoStart.read(home) == journal.DemoStart(boot_id, process.pid):
+                    if journal.held(home / "journal.sqlite"):
+                        claim_file.unlink()
+                    else:
+                        shutil.rmtree(home)
+                        store = TargetStore(home.parent)
+                        store.forget_home(home)
+                        store._save_locked()
         raise
     names = ", ".join(t.name for t in added)
     text = (
@@ -1068,21 +1100,23 @@ def demo_start(args: argparse.Namespace) -> int:
 def demo_stop(args: argparse.Namespace) -> int:
     store = TargetStore()
     home = store.home / "demo"
-    record, advice = _demo(home)
-    if record:
-        _terminate(record["pid"])
-        store = TargetStore()  # read again: a `homunculus demo start` that was just finishing has saved its targets
-    elif advice:
-        raise ClientError(
-            f"a service holds the demo's files ({home}) but does not answer; nothing was stopped or removed",
-            hint=advice,
-        )
-    removed = store.forget_home(home)
-    existed = home.exists()
-    shutil.rmtree(home, ignore_errors=True)
-    store.save()  # after the demo's files are gone, so an otherwise empty home directory goes too
-    if home.exists():
-        raise ClientError(f"could not remove all of {home}", hint="if something still writes there, stop it first")
+    with journal.lock_directory(home.parent):
+        record, advice = _demo(home)
+        if record:
+            _terminate(record["pid"], home / "journal.sqlite")
+        elif advice:
+            raise ClientError(
+                f"a service holds the demo's files ({home}) but does not answer; nothing was stopped or removed",
+                hint=advice,
+            )
+        try:
+            shutil.rmtree(home)
+            existed = True
+        except FileNotFoundError:
+            existed = False
+        store = TargetStore(home.parent)
+        removed = store.forget_home(home)
+        store._save_locked()
     stopped = f"stopped the demo service (pid {record['pid']})" if record else "no demo service was running"
     cleaned = (
         f"removed {home} and targets {', '.join(removed) or 'none'}" if existed or removed else "nothing to remove"
@@ -1266,6 +1300,7 @@ def _parser() -> argparse.ArgumentParser:
     command(demo, "status", demo_status, "Say whether the demo service is running.")
 
     leaf = command(commands, "serve", serve, "Run a service in the foreground until interrupted.")
+    leaf.add_argument("--demo-attempt", help=argparse.SUPPRESS)
     backend_options(leaf)
     leaf.add_argument(
         "--home",

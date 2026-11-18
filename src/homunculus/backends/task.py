@@ -11,6 +11,9 @@ it. It maps four profiles onto the motor controls the simulator offers over HTTP
     gripper.width/1 on the left gripper   ->  one `grip` action
     tool.pose.linear/1 on either hand     ->  repeated `step` actions with a hand target moving along
                                               the straight segment, judged against the measured tool site
+    tool.pose.linear/1 on both_hands      ->  the same for the left tool site, with the right hand target
+                                              carried along rigidly in the same steps (an object held in
+                                              both hands moves without being pulled between them)
     hand.posture/1 on the right hand      ->  one `grip` action to the opening the posture names
 
 The task's world is stepped: physics advances only while an action runs. The
@@ -34,7 +37,9 @@ import socket
 import subprocess
 import threading
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterator, Sequence
+from concurrent.futures import Future
+from contextlib import AbstractContextManager, ExitStack, contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -46,7 +51,6 @@ from ..models import (
     BaseVelocityLimits,
     CameraImage,
     ClockInfo,
-    Contract,
     GripperWidthGoal,
     GripperWidthLimits,
     HandPostureGoal,
@@ -60,7 +64,7 @@ from ..models import (
     ToolPoseLimits,
 )
 from ..profiles import ActivityStatus, PoseJudge, PostureJudge, VelocityJudge, WidthJudge
-from ..runtime import Backend, BackendFacts, Feedback, Frame, ResourceSpec, StartupError
+from ..runtime import Backend, BackendFacts, Feedback, Frame, GoalCommand, ResourceSpec, StartupError
 
 log = logging.getLogger(__name__)
 
@@ -115,8 +119,41 @@ RIGHT_POSTURES = {
         "index_0": 0.85,
         "index_1": 1.40,
     },
+    # Partly open: where an empty hand rests at openings 0.5, 0.4 and 0.3 (local macOS run, 2026-11-17), within
+    # 0.02 rad of the task's own targets. Below 0.3 an empty hand's fingers already touch each other, so no
+    # posture is offered between open_30 and closed. Closed on an object, these press more gently than closed.
+    "open_50": {
+        "thumb_0": -0.548,
+        "thumb_1": -0.56,
+        "thumb_2": -0.608,
+        "middle_0": 0.531,
+        "middle_1": 0.708,
+        "index_0": 0.531,
+        "index_1": 0.708,
+    },
+    "open_40": {
+        "thumb_0": -0.548,
+        "thumb_1": -0.644,
+        "thumb_2": -0.733,
+        "middle_0": 0.64,
+        "middle_1": 0.852,
+        "index_0": 0.64,
+        "index_1": 0.852,
+    },
+    "open_30": {
+        "thumb_0": -0.547,
+        "thumb_1": -0.729,
+        "thumb_2": -0.858,
+        "middle_0": 0.75,
+        "middle_1": 0.997,
+        "index_0": 0.75,
+        "index_1": 0.997,
+    },
 }
-POSTURE_OPENING = {"open": 1.0, "closed": 0.0}
+POSTURE_OPENING = {"open": 1.0, "open_50": 0.5, "open_40": 0.4, "open_30": 0.3, "closed": 0.0}
+# The pose target that moves both hands: the left tool site is commanded and judged; the right hand target keeps
+# its pose relative to it. The right hand must stay within the path tolerance of where it is carried.
+BOTH_HANDS = "both_hands"
 # Hand pose goals. The workspace and speeds are the bounds the task's own hand controls enforce. The
 # tolerances were checked against 48 free-space goals on Modal: see docs/guide.md.
 POSE_LIMITS = {
@@ -184,16 +221,17 @@ def robots(
     task_path, python_path, state_path = (
         Path(os.path.abspath(Path(v).expanduser())) for v in (task_dir, python, state_dir)
     )
-    process, url = _start_simulator(task_path, python_path, state_path)
-    try:
-        task = TaskBackend(task_path.name, url, epoch=str(state_path), process=process, state_dir=state_path)
-    except BaseException:  # including an interrupted start: the simulator must not outlive this service
-        process.kill()
-        raise
+    task = TaskBackend(
+        task_path.name,
+        epoch=str(state_path),
+        state_dir=state_path,
+        simulator=_start_simulator(task_path, python_path, state_path),
+    )
     return {f"task-{task.name}": task}
 
 
-def _start_simulator(task_dir: Path, python: Path, state_dir: Path) -> tuple[subprocess.Popen[bytes], str]:
+@contextmanager
+def _start_simulator(task_dir: Path, python: Path, state_dir: Path) -> Iterator[tuple[subprocess.Popen[bytes], str]]:
     """Start the task's own simulator entry point recording into state_dir; return it and its URL."""
     entry = task_dir / "environment" / "simulator" / "start.py"
     if not entry.is_file():
@@ -212,39 +250,53 @@ def _start_simulator(task_dir: Path, python: Path, state_dir: Path) -> tuple[sub
     # told not to write bytecode into the downloaded tree. It records into state_dir only.
     # Downloaded code gets the settings it reads, not the whole environment of this service.
     settings = {name: os.environ[name] for name in SIMULATOR_ENV if name in os.environ}
-    with open(state_dir / "simulator.log", "w") as output:
-        process = subprocess.Popen(
+    with (
+        open(state_dir / "simulator.log", "w") as output,
+        subprocess.Popen(
             [str(python), "-I", "-B", str(entry)],
             cwd=state_dir,
             env={**settings, "STATE_DIR": str(state_dir), "SIM_PORT": str(port)},
             stdout=output,
             stderr=subprocess.STDOUT,
             stdin=subprocess.DEVNULL,
-        )
-    return process, f"http://127.0.0.1:{port}"
+        ) as process,
+    ):
+        try:
+            yield process, f"http://127.0.0.1:{port}"
+        finally:
+            process.terminate()
+            try:
+                process.wait(timeout=10.0)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()
 
 
 class _Refused(Exception):
     """The task simulator rejected an action (finished episode, exhausted budget, fallen robot)."""
 
 
+class _Cancelled(Exception):
+    """The worker stopped sending steps for an overtaken activity."""
+
+
 class TaskBackend(Backend):
+    reports_goal_samples = True
+
     def __init__(
         self,
         name: str,
-        url: str,
+        url: str = "",
         *,
         epoch: str,
-        process: subprocess.Popen[bytes] | None = None,
         state_dir: Path | None = None,
+        simulator: AbstractContextManager[tuple[subprocess.Popen[bytes], str]] | None = None,
     ):
-        """`process` and `state_dir` are the simulator this service started; None when it attached to one."""
+        """Start the owned simulator or attach to the given URL."""
         self.name = name
         self._epoch = epoch  # names this episode on the task_sim clock
-        self._process, self._state_dir = process, state_dir
-        # trust_env=False: the simulator is on loopback, never behind a proxy the environment names.
-        self._http = httpx.Client(base_url=url, timeout=300.0, trust_env=False)
-
+        self._state_dir = state_dir
+        self._process: subprocess.Popen[bytes] | None = None
         self._lock = threading.Lock()  # guards everything below, shared by the worker and the control thread
         self._robot: dict[str, Any] = {}
         self._sim_time = 0.0
@@ -254,13 +306,26 @@ class TaskBackend(Backend):
         self._activities: dict[str, ActivityStatus] = {}
         self._owner: dict[str, str] = {}  # resource id -> activity commanding it
         self._cancelled: set[str] = set()
+        self._closing = threading.Event()
+        self._commands: queue.Queue[Callable[[], None] | None] = queue.Queue()
+        with ExitStack() as resources:
+            if simulator is not None:
+                self._process, url = resources.enter_context(simulator)
+            self._http = resources.enter_context(httpx.Client(base_url=url, timeout=300.0, trust_env=False))
+            self._read_initial_state(url)
+            self._worker = threading.Thread(target=self._work, name=f"task:{self.name}")
+            resources.callback(self._stop_worker)
+            self._worker.start()
+            self._resources = resources.pop_all()
+
+    def _read_initial_state(self, url: str) -> None:
         try:
             self._wait_until_ready()
-            self._record(self._http.get("/state").json())
+            self._record(self._http.get("/state").raise_for_status().json())
             self._revisions = {"task": self.name, "simulator": url}
-            if state_dir is not None:
-                self._revisions["scene_seed"] = str(json.loads((state_dir / "seed.json").read_text())["seed"])
-                self._revisions["state_dir"] = str(state_dir)
+            if self._state_dir is not None:
+                self._revisions["scene_seed"] = str(json.loads((self._state_dir / "seed.json").read_text())["seed"])
+                self._revisions["state_dir"] = str(self._state_dir)
             hands = self._robot["hands"]
             # What each hand's controller holds while no goal commands it: where it was measured at start.
             self._hand_target = {side: _tool_pose(hands[side]) for side in SIDES}
@@ -274,15 +339,11 @@ class TaskBackend(Backend):
                 "right_hand": True,
             }
             self.advance()  # fails here, not later, if this task reports a different robot state
-        except (KeyError, TypeError, ValueError) as error:
+        except (KeyError, TypeError, ValueError, httpx.HTTPError) as error:
             raise StartupError(
                 f"the simulator of {self.name} does not report the robot state this adapter maps "
                 f"({type(error).__name__}: {error}); it was written for g1-dining-salt-mill"
             ) from None
-        # Simulator actions block for as long as their physics takes, so one worker runs them in order.
-        self._commands: queue.Queue[Callable[[], None] | None] = queue.Queue()
-        self._worker = threading.Thread(target=self._work, name=f"task:{self.name}", daemon=True)
-        self._worker.start()
 
     def _alive(self) -> bool:
         """Whether the simulator can still answer: a started process has not exited (an attached one is assumed
@@ -467,6 +528,22 @@ class TaskBackend(Backend):
                     for side in SIDES
                 ),
                 ProfileBinding(
+                    profile="tool.pose.linear/1",
+                    target=BOTH_HANDS,
+                    role="both_arms",
+                    resources=["left_arm", "right_arm"],
+                    controller="task arm controller",
+                    assistance=(
+                        "moves the left tool site like a left_hand goal and, in the same steps, carries the right "
+                        "hand target with it rigidly, so the right hand keeps its pose relative to the left; for an "
+                        "object held in both hands. The goal also fails if the right hand is measured more than the "
+                        "path tolerance from where it is carried"
+                    ),
+                    stop_deadline_wall_s=15.0,
+                    limits=ToolPoseLimits(**POSE_LIMITS, control_point="left_tool"),
+                    **common,
+                ),
+                ProfileBinding(
                     profile="hand.posture/1",
                     target="right_hand",
                     role="right_hand",
@@ -474,8 +551,9 @@ class TaskBackend(Backend):
                     controller="task finger controller",
                     assistance=(
                         "the task ramps the fingers over one simulated second; closed is where an empty hand's "
-                        "fingers stop on each other; grasping is by contact only, so a hand closed on an object "
-                        "stops short of it"
+                        "fingers stop on each other, and open_50, open_40 and open_30 are partly open (50, 40 and "
+                        "30 percent); grasping is by contact only, so a hand closed on an object stops short of it, "
+                        "and a more open posture presses on it more gently"
                     ),
                     stop_deadline_wall_s=15.0,
                     limits=HandPostureLimits(
@@ -497,22 +575,25 @@ class TaskBackend(Backend):
             period_s=0.05,
         )
 
-    def apply(self, activity_id: str, contract: Contract) -> None:
-        action, rid = contract.action, contract.resources[0]
+    def apply(self, activity_id: str, contract: GoalCommand) -> None:
         run: Callable[..., None] = {
             BaseVelocityGoal: self._travel,
             GripperWidthGoal: self._grip,
             ToolPoseGoal: self._pose,
             HandPostureGoal: self._posture,
-        }[type(action)]
+        }[type(contract.action)]
         with self._lock:
             self._activities[activity_id] = ActivityStatus("executing")
-            self._owner[rid] = activity_id
-            self._settled[rid] = False
-        self._commands.put(lambda: run(activity_id, action, contract.limits))
+            for rid in contract.resources:
+                self._owner[rid] = activity_id
+                self._settled[rid] = False
+        self._commands.put(lambda: run(activity_id, contract.judge))
 
     def stop(self, resources: Sequence[str]) -> None:
         with self._lock:
+            # Stopping one resource of a goal that owns several stops the goal, so all of them come to rest.
+            stopped = {self._owner[rid] for rid in resources if rid in self._owner}
+            resources = list(dict.fromkeys([*resources, *(r for r, a in self._owner.items() if a in stopped)]))
             for rid in resources:
                 activity_id = self._owner.pop(rid, None)
                 if activity_id is not None:
@@ -524,17 +605,41 @@ class TaskBackend(Backend):
                 return  # a finished episode never steps again: what was measured before it ended stands
         self._commands.put(lambda: self._fallback(list(resources)))
 
-    def manage(self, operation: str, parameters: dict[str, Any]) -> dict[str, Any]:
+    def manage(self, operation: str, parameters: dict[str, Any]) -> dict[str, Any] | Future[dict[str, Any]]:
         if operation == "recover":
             self.stop(parameters["resources"])
             return {}
         if operation != "episode.finish":
             raise RobotError("unsupported_operation", f"the task adapter has no {operation}", operation=operation)
         # Ends the episode the way the task defines it. Queued behind any action still running.
-        done = threading.Event()
-        outcome: dict[str, Any] = {}
+        result: Future[dict[str, Any]] = Future()
+
+        def confirmed() -> bool:
+            with self._lock:
+                if self._finished:
+                    result.set_result({**self._task, "finished": True, "sim_time_s": self._sim_time})
+                    return True
+            return False
+
+        def confirm() -> None:
+            if self._closing.is_set():
+                return
+            try:
+                reply = self._http.get("/state", timeout=2.0).raise_for_status().json()
+                with self._lock:
+                    self._record(reply)
+                if confirmed():
+                    return
+            except httpx.HTTPError, KeyError, TypeError, ValueError:
+                log.debug("could not confirm episode finish", exc_info=True)
+            # Queue another reading behind any stop that arrived while this request was in flight.
+            if not self._closing.wait(0.2):
+                self._commands.put(confirm)
 
         def finish() -> None:
+            if result.cancelled() or self._closing.is_set():
+                result.cancel()
+                return
             try:
                 with self._lock:
                     moving = [rid for rid, settled in self._settled.items() if not settled]
@@ -542,22 +647,33 @@ class TaskBackend(Backend):
                     # A paused world proves nothing about the motion in it. What was cut short is brought to
                     # rest, and measured at rest, while the episode can still step.
                     self._fallback(moving)
-                outcome["reply"] = self._act({"action": "finish"})
-            except Exception as error:  # reported to the operator below
-                outcome["error"] = str(error)
-            done.set()
+            except Exception as error:
+                if result.set_running_or_notify_cancel():
+                    result.set_exception(error)
+                return
+            if self._closing.is_set():
+                result.cancel()
+            if not result.set_running_or_notify_cancel():
+                return
+            try:
+                self._act({"action": "finish"}, timeout=60.0)
+            except httpx.TransportError, ValueError, KeyError, TypeError:
+                log.warning("the simulator reply to episode.finish was lost and will be checked against /state")
+                with self._lock:
+                    self._reachable = False
+                self._commands.put(confirm)
+            except Exception as error:
+                result.set_exception(error)
+            else:
+                if not confirmed():
+                    self._commands.put(confirm)
 
         with self._lock:
             self._cancelled.update(self._owner.values())
             self._owner.clear()
             self._activities.clear()
         self._commands.put(finish)
-        if not done.wait(60.0):
-            raise RobotError("backend_error", "the task simulator did not finish the episode in time")
-        if "error" in outcome:
-            raise RobotError("backend_error", f"the task simulator did not finish the episode: {outcome['error']}")
-        with self._lock:
-            return {"finished": True, "sim_time_s": self._sim_time, **self._task}
+        return result
 
     def capture(self, sensor: str) -> list[Frame]:
         try:
@@ -654,15 +770,13 @@ class TaskBackend(Backend):
             return feedback
 
     def close(self) -> None:
+        self._resources.close()
+
+    def _stop_worker(self) -> None:
+        self._closing.set()
         self._commands.put(None)
-        self._worker.join(timeout=30.0)
-        if self._process is not None:  # an attached simulator belongs to whoever started it
-            self._process.terminate()
-            try:
-                self._process.wait(timeout=10.0)
-            except subprocess.TimeoutExpired:
-                self._process.kill()
-        self._http.close()
+        if self._worker.ident is not None:
+            self._worker.join()
 
     # -- the worker: every simulator action runs here, in order ------------
 
@@ -670,14 +784,16 @@ class TaskBackend(Backend):
         while (command := self._commands.get()) is not None:
             try:
                 command()
+            except _Cancelled:
+                continue
             except Exception:
                 # Feedback stays invalid until the simulator answers again, so nothing is confirmed meanwhile.
                 log.exception("task simulator command failed")
                 with self._lock:
                     self._reachable = False
 
-    def _act(self, request: dict[str, Any]) -> dict[str, Any]:
-        response = self._http.post("/act", json=request)
+    def _act(self, request: dict[str, Any], *, timeout: float | None = None) -> dict[str, Any]:
+        response = self._http.post("/act", json=request, timeout=self._http.timeout if timeout is None else timeout)
         if response.status_code == 400:
             raise _Refused(response.json().get("error", "rejected"))
         response.raise_for_status()
@@ -696,7 +812,7 @@ class TaskBackend(Backend):
     def _skip(self, activity_id: str) -> bool:
         """True once a stop has overtaken this activity; the stop queued behind it applies the fallback."""
         with self._lock:
-            cancelled = activity_id in self._cancelled
+            cancelled = activity_id in self._cancelled or self._closing.is_set()
             self._cancelled.discard(activity_id)
             return cancelled
 
@@ -705,10 +821,9 @@ class TaskBackend(Backend):
             if activity_id in self._activities:  # a stopped activity is no longer reported
                 self._activities[activity_id] = status
 
-    def _travel(self, activity_id: str, action: BaseVelocityGoal, limits: BaseVelocityLimits) -> None:
+    def _travel(self, activity_id: str, judge: VelocityJudge) -> None:
         """Timed travel as equal `step` actions, then steps at rest. The judge decides from the measured poses."""
-        with self._lock:
-            judge = VelocityJudge(action, limits, self._sim_time, tuple(self._robot["base_xy_yaw"]), action.duration_s)
+        action = judge.command
         count = max(1, math.ceil(action.duration_s / STEP_MAX_S))
         seconds = max(STEP_MIN_S, action.duration_s / count)
         command = [action.forward_m_s, action.left_m_s, action.yaw_rate_rad_s]
@@ -725,7 +840,7 @@ class TaskBackend(Backend):
                     self._report(activity_id, status)
                     return
             self._report(activity_id, ActivityStatus("finishing"))
-            rested, _ = self._rest(["base"])
+            rested, _ = self._rest(["base"], activity_id=activity_id)
         except _Refused as refusal:
             self._report(activity_id, ActivityStatus("failed", error="task_rejected", detail=str(refusal)))
             return
@@ -739,16 +854,18 @@ class TaskBackend(Backend):
         status.measurements["stable"] = stable
         self._report(activity_id, status)
 
-    def _grip(self, activity_id: str, action: GripperWidthGoal, limits: GripperWidthLimits) -> None:
+    def _grip(self, activity_id: str, judge: WidthJudge) -> None:
         """One `grip` action, then steps at rest. The judge decides from the gap measured after each step."""
         if self._skip(activity_id):
             return
-        judge = WidthJudge(action, limits)
+        action = judge.action
         try:
             self._act({"action": "grip", "hand": "left", "opening": action.width_m / MAX_GAP_M})
             self._report(activity_id, ActivityStatus("finishing"))
             rested, status = self._rest(
-                ["left_gripper"], until=lambda robot: judge.update(robot["hands"]["left"]["gap_m"], SETTLE_STEP_S)
+                ["left_gripper"],
+                activity_id=activity_id,
+                until=lambda robot: judge.update(robot["hands"]["left"]["gap_m"], SETTLE_STEP_S),
             )
         except _Refused as refusal:
             self._report(activity_id, ActivityStatus("failed", error="task_rejected", detail=str(refusal)))
@@ -763,12 +880,20 @@ class TaskBackend(Backend):
         status.measurements.update(touch_normal_force_N=hand["touch_normal_force_N"], at_rest=rested >= SETTLE_S)
         self._report(activity_id, status)
 
-    def _pose(self, activity_id: str, action: ToolPoseGoal, limits: ToolPoseLimits) -> None:
+    def _pose(self, activity_id: str, judge: PoseJudge) -> None:
         """Steps that move the hand target along the judge's reference, then steps holding the goal pose, until
-        the judge decides from the tool site measured after each step."""
-        side, rid = action.target.removesuffix("_hand"), f"{action.target.removesuffix('_hand')}_arm"
+        the judge decides from the tool site measured after each step.
+
+        On both_hands the left tool site is judged, and each step also sends the right hand target, carried
+        along by the same rigid motion that takes the reference from its start to where it is now."""
+        action, limits = judge.action, judge.limits
+        both = action.target == BOTH_HANDS
+        side = "left" if both else action.target.removesuffix("_hand")
+        rids = ["left_arm", "right_arm"] if both else [f"{side}_arm"]
         with self._lock:
             start = _tool_pose(self._robot["hands"][side])
+            # The right hand is carried from where it is commanded to hold, which a loaded hand sags below.
+            carried = self._hand_target["right"]
         if not all(
             lo <= v <= hi
             for v, lo, hi in zip(start["position_m"], limits.workspace_min_m, limits.workspace_max_m, strict=True)
@@ -778,8 +903,7 @@ class TaskBackend(Backend):
                 activity_id, ActivityStatus("failed", {"start": start}, error="start_outside_workspace", detail=detail)
             )
             return
-        judge = PoseJudge(action, limits, start["position_m"], start["orientation_xyzw"])
-        elapsed = 0.0
+        elapsed, follower_error = 0.0, 0.0
         try:
             while True:
                 if self._skip(activity_id):
@@ -787,18 +911,38 @@ class TaskBackend(Backend):
                 dt = POSE_STEP_S if elapsed < judge.duration_s else SETTLE_STEP_S
                 elapsed += dt
                 position, xyzw = judge.reference(elapsed)
+                targets = {side: {"frame_id": "world", "position_m": position, "orientation_xyzw": xyzw}}
+                if both:
+                    targets["right"] = _carry(carried, judge.start_m, judge.start_xyzw, position, xyzw)
                 with self._lock:
-                    self._hand_target[side] = {"frame_id": "world", "position_m": position, "orientation_xyzw": xyzw}
-                target = {"position": position, "quaternion": [xyzw[3], *xyzw[:3]]}
-                reply = self._act({"action": "step", "seconds": dt, "hands": {side: target}})
+                    self._hand_target.update(targets)
+                hands = {
+                    s: {
+                        "position": t["position_m"],
+                        "quaternion": [t["orientation_xyzw"][3], *t["orientation_xyzw"][:3]],
+                    }
+                    for s, t in targets.items()
+                }
+                reply = self._act({"action": "step", "seconds": dt, "hands": hands})
                 if reply["robot"]["fallen"]:
                     self._report(activity_id, ActivityStatus("failed", error="robot_fell", detail="the robot fell"))
                     return
                 measured = _tool_pose(reply["robot"]["hands"][side])
                 status = judge.update(elapsed, measured["position_m"], measured["orientation_xyzw"], dt)
+                if both and status.phase != "failed":
+                    off = math.dist(reply["robot"]["hands"]["right"]["position"], targets["right"]["position_m"])
+                    follower_error = max(follower_error, off)
+                    if off > limits.path_tolerance_m:
+                        detail = "the right hand fell behind where it was carried; the held object may have slipped"
+                        status = ActivityStatus(
+                            "failed",
+                            {**status.measurements, "right_error_m": off, "at_s": elapsed},
+                            error="path_tolerance_violated",
+                            detail=detail,
+                        )
                 if status.phase == "failed":
                     self._report(activity_id, status)
-                    self._fallback([rid])  # the hand holds where it was measured, not the unreached target
+                    self._fallback(rids)  # the hands hold where they were measured, not the unreached targets
                     return
                 if status.phase == "done":
                     break
@@ -809,23 +953,27 @@ class TaskBackend(Backend):
             return
         with self._lock:
             hand = self._robot["hands"][side]
-            self._settled[rid] = True  # the judge measured it within tolerance for settle_time_s
+            for rid in rids:
+                self._settled[rid] = True  # the judge measured it within tolerance for settle_time_s
         status.measurements.update(
             touch_normal_force_N=hand["touch_normal_force_N"], controller_status=hand["controller_status"]
         )
+        if both:
+            status.measurements["peak_right_error_m"] = follower_error
         self._report(activity_id, status)
 
-    def _posture(self, activity_id: str, action: HandPostureGoal, limits: HandPostureLimits) -> None:
+    def _posture(self, activity_id: str, judge: PostureJudge) -> None:
         """One `grip` action to the posture's opening, then steps at rest. The judge decides from the finger
         angles measured after each step."""
         if self._skip(activity_id):
             return
-        judge = PostureJudge(action, limits)
+        action, limits = judge.action, judge.limits
         try:
             self._act({"action": "grip", "hand": "right", "opening": POSTURE_OPENING[action.posture]})
             self._report(activity_id, ActivityStatus("finishing"))
             rested, status = self._rest(
                 ["right_hand"],
+                activity_id=activity_id,
                 until=lambda robot: judge.update(
                     {f"{name}": angle for name, angle in robot["hands"]["right"]["finger_joint_angles"].items()},
                     SETTLE_STEP_S,
@@ -848,6 +996,9 @@ class TaskBackend(Backend):
     def _fallback(self, resources: Sequence[str]) -> None:
         """What stop() queues: no travel, the gripper held where it is measured to be, and each arm held at its
         hand's measured pose."""
+        with self._lock:
+            if self._finished:
+                return
         try:
             rested, _ = self._rest(resources, hold_measured=True)
             settled = rested >= SETTLE_S
@@ -863,6 +1014,7 @@ class TaskBackend(Backend):
         resources: Sequence[str],
         *,
         hold_measured: bool = False,
+        activity_id: str | None = None,
         until: Callable[[dict[str, Any]], ActivityStatus] | None = None,
     ) -> tuple[float, ActivityStatus]:
         """Step with zero travel until measurements show these resources at rest and `until`, if given, decides
@@ -870,6 +1022,8 @@ class TaskBackend(Backend):
         were last measured at rest, and `until`'s last decision.
 
         hold_measured: first set the left gripper and the arms among `resources` to hold where they are measured.
+        The jaws are never set wider than they were asked to be: jaws stopped on an object keep squeezing it,
+        since a position-controlled gripper held at its measured gap presses with no force and drops what it holds.
         The base is at rest when the task reports a stable stand; a gripper, hand or arm when it stops moving.
         """
         with self._lock:
@@ -877,7 +1031,8 @@ class TaskBackend(Backend):
         request: dict[str, Any] = {"action": "step", "seconds": SETTLE_STEP_S}
         if hold_measured:
             if "left_gripper" in resources:
-                request["openings"] = {"left": min(1.0, before["hands"]["left"]["gap_m"] / MAX_GAP_M)}
+                left = before["hands"]["left"]
+                request["openings"] = {"left": min(1.0, left["requested_opening"], left["gap_m"] / MAX_GAP_M)}
             hands = {}
             for side in SIDES:
                 if f"{side}_arm" in resources:
@@ -892,6 +1047,8 @@ class TaskBackend(Backend):
                 request["hands"] = hands
         at_rest_for, waited, status = 0.0, 0.0, ActivityStatus("finishing")
         while (at_rest_for < SETTLE_S or (until is not None and status.phase != "done")) and waited < SETTLE_LIMIT_S:
+            if activity_id is not None and self._skip(activity_id):
+                raise _Cancelled
             robot = self._act(request)["robot"]
             waited += SETTLE_STEP_S
             resting = _at_rest(resources, before, robot)
@@ -919,6 +1076,43 @@ def _at_rest(resources: Sequence[str], before: dict[str, Any], after: dict[str, 
         ),
     }
     return all(checks[rid]() for rid in resources)
+
+
+def _carry(
+    pose: dict[str, Any],
+    start_m: Sequence[float],
+    start_xyzw: Sequence[float],
+    now_m: Sequence[float],
+    now_xyzw: Sequence[float],
+) -> dict[str, Any]:
+    """`pose` moved by the rigid motion that takes (start_m, start_xyzw) to (now_m, now_xyzw)."""
+    turn = _qmul(now_xyzw, _qconj(start_xyzw))
+    offset = _rotate(turn, [p - s for p, s in zip(pose["position_m"], start_m, strict=True)])
+    return {
+        "frame_id": "world",
+        "position_m": [n + o for n, o in zip(now_m, offset, strict=True)],
+        "orientation_xyzw": _qmul(turn, pose["orientation_xyzw"]),
+    }
+
+
+def _qmul(a: Sequence[float], b: Sequence[float]) -> list[float]:
+    """The product a * b of two xyzw quaternions: b's rotation, then a's."""
+    ax, ay, az, aw = a
+    bx, by, bz, bw = b
+    return [
+        aw * bx + ax * bw + ay * bz - az * by,
+        aw * by - ax * bz + ay * bw + az * bx,
+        aw * bz + ax * by - ay * bx + az * bw,
+        aw * bw - ax * bx - ay * by - az * bz,
+    ]
+
+
+def _qconj(q: Sequence[float]) -> list[float]:
+    return [-q[0], -q[1], -q[2], q[3]]
+
+
+def _rotate(q: Sequence[float], v: Sequence[float]) -> list[float]:
+    return _qmul(_qmul(q, [*v, 0.0]), _qconj(q))[:3]
 
 
 def _flat_pose(pose: dict[str, Any]) -> dict[str, float]:

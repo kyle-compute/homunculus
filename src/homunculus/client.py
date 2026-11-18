@@ -9,7 +9,6 @@ does not renew a session or re-send a rejected command on its own.
 from __future__ import annotations
 
 import errno
-import fcntl
 import json
 import os
 import time
@@ -22,6 +21,7 @@ from typing import Any
 import httpx
 from pydantic import BaseModel, ValidationError
 
+from .journal import lock_directory
 from .models import (
     ERROR_STATUS,
     TERMINAL_GOAL_STATES,
@@ -115,30 +115,6 @@ def default_home() -> Path:
     return Path(os.environ.get("HOMUNCULUS_HOME") or "~/.homunculus").expanduser()
 
 
-@contextmanager
-def _exclusive(directory: Path) -> Iterator[None]:
-    """Hold a directory, made if need be, for one process at a time. The hold ends here or with the process."""
-    while True:
-        directory.mkdir(parents=True, exist_ok=True)
-        try:
-            descriptor = os.open(directory, os.O_RDONLY)
-        except FileNotFoundError:
-            continue  # removed again by the command that held it
-        try:
-            fcntl.flock(descriptor, fcntl.LOCK_EX)
-            # While this waited, the holder may have removed the directory and another command made it
-            # again. What is held here is then not the directory that the others take.
-            try:
-                current = os.stat(directory).st_ino
-            except FileNotFoundError:
-                continue
-            if current == os.fstat(descriptor).st_ino:
-                yield
-                return
-        finally:
-            os.close(descriptor)
-
-
 class TargetStore:
     """Named targets in <home>/targets.json. The file holds access tokens, so it is owner-only.
 
@@ -165,7 +141,9 @@ class TargetStore:
 
     def _read(self) -> dict[str, Any]:
         try:
-            stored = json.loads(self.path.read_text()) if self.path.exists() else {}
+            stored = json.loads(self.path.read_text())
+        except FileNotFoundError:
+            return {}
         except ValueError as error:
             raise ClientError(f"{self.path} is not valid JSON ({error})", hint=REPAIR) from None
         if not isinstance(stored, dict) or not isinstance(stored.get("targets", {}), dict):
@@ -183,43 +161,56 @@ class TargetStore:
         commands can also finish in the same instant, so reading the file and replacing it is one step
         that commands take in turn.
         """
+        if not self.targets and not self.home.exists():
+            self._synced = self._view()
+            return
+        with lock_directory(self.home):
+            self._save_locked()
+
+    def _save_locked(self) -> None:
         before, mine = self._synced, self._view()
+        stored = self._read()
+        targets = {name: dict(entry) for name, entry in stored.get("targets", {}).items()}
+        for name in before["targets"].keys() - mine["targets"].keys():
+            current, base = targets.get(name), before["targets"][name]
+            if current is not None and (current["url"], current["robot_id"]) == (base["url"], base["robot_id"]):
+                del targets[name]
+        for name, target in mine["targets"].items():
+            base = before["targets"].get(name)
+            current = targets.get(name)
+            if base is None:
+                targets.setdefault(name, target)
+            elif current is not None and (current["url"], current["robot_id"]) == (base["url"], base["robot_id"]):
+                if (target["url"], target["robot_id"]) != (base["url"], base["robot_id"]):
+                    targets[name] = target
+                else:
+                    current.update({field: value for field, value in target.items() if value != base[field]})
+        default = mine["default"] if mine["default"] != before["default"] else stored.get("default")
+        if default not in targets:
+            default = None  # its target is gone; no other robot is chosen in its place
+        if not targets:
+            # Nothing to remember: leave no file, and no directory if this store was all it held.
+            self.path.unlink(missing_ok=True)
+            try:
+                self.home.rmdir()  # removes only an empty directory
+            except FileNotFoundError:
+                pass  # another command removed it first
+            except OSError as error:
+                if error.errno not in (errno.ENOTEMPTY, errno.EEXIST):  # it holds something else: it stays
+                    raise
+            self._synced = mine
+            return
+        document = {"default": default, "targets": targets}
+        if document != stored:
+            scratch = self.path.with_suffix(f".{os.getpid()}.tmp")
+            try:
+                descriptor = os.open(scratch, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+                with os.fdopen(descriptor, "w") as file:
+                    json.dump(document, file, indent=2)
+                scratch.replace(self.path)
+            finally:
+                scratch.unlink(missing_ok=True)
         self._synced = mine
-        if not mine["targets"] and not self.home.exists():
-            return  # nothing to keep, and no place where anything was kept
-        with _exclusive(self.home):
-            stored = self._read()
-            targets = {name: dict(entry) for name, entry in stored.get("targets", {}).items()}
-            for name in before["targets"].keys() - mine["targets"].keys():
-                targets.pop(name, None)  # removed here
-            for name, target in mine["targets"].items():
-                base = before["targets"].get(name)
-                if base is None:
-                    targets[name] = target  # added here
-                elif name in targets:  # one that another command removed meanwhile stays removed
-                    targets[name].update({field: value for field, value in target.items() if value != base[field]})
-            default = mine["default"] if mine["default"] != before["default"] else stored.get("default")
-            if default not in targets:
-                default = None  # its target is gone; no other robot is chosen in its place
-            if not targets:
-                # Nothing to remember: leave no file, and no directory if this store was all it held.
-                self.path.unlink(missing_ok=True)
-                try:
-                    self.home.rmdir()  # removes only an empty directory
-                except FileNotFoundError:
-                    pass  # another command removed it first
-                except OSError as error:
-                    if error.errno not in (errno.ENOTEMPTY, errno.EEXIST):  # it holds something else: it stays
-                        raise
-                return
-            document = {"default": default, "targets": targets}
-            if document == stored:
-                return
-            scratch = self.path.with_suffix(f".{os.getpid()}.tmp")  # per process: two savers never share one
-            descriptor = os.open(scratch, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-            with os.fdopen(descriptor, "w") as file:
-                json.dump(document, file, indent=2)
-            scratch.replace(self.path)
 
     def get(self, name: str | None = None) -> Target:
         """The named target; with no name, $HOMUNCULUS_TARGET's or the default. An empty name is unknown, not the
@@ -437,40 +428,54 @@ class RobotClient:
         Pass the request_id of an attempt that got no answer to learn its session instead of being
         refused by it.
         """
+        session = self._acquire_session(lifetime_wall_s, request_id, self._headers(takeover), takeover=takeover)
+        self._remember_session(session, takeover)
+        return session
+
+    def _acquire_session(
+        self, lifetime_wall_s: float | None, request_id: str | None, headers: dict[str, str], *, takeover: bool
+    ) -> Session:
         request = SessionOpen(
             request_id=_stated(request_id, _request_id),
             context_id=self.describe().context_id,
             lifetime_wall_s=lifetime_wall_s,
             takeover=takeover,
         )
-        session = self._call("POST", "/sessions", Session, body=request, operator=takeover)
+        return self._call("POST", "/sessions", Session, body=request, headers=headers)
+
+    def _remember_session(self, session: Session, operator: bool) -> None:
         self._record(
             session_id=session.session_id,
             context_id=session.context_id,
-            session_operator=takeover,
+            session_operator=operator,
             stream_id=None,
             stream_sequence=0,
         )
-        return session
 
     def renew_session(self, lifetime_wall_s: float | None = None) -> Session:
         request = SessionRenew(lifetime_wall_s=lifetime_wall_s)
         return self._call("POST", f"/sessions/{self._session()}/renew", Session, body=request)
 
     def close_session(self) -> Session:
-        session = self._call("POST", f"/sessions/{self._session()}/close", Session)
-        self._record(session_id=None, stream_id=None, session_operator=False)
+        return self._release_session(self._session(), self._headers())
+
+    def _release_session(self, session_id: str, headers: dict[str, str]) -> Session:
+        session = self._call("POST", f"/sessions/{session_id}/close", Session, headers=headers)
+        if self.target.session_id == session_id:
+            self._record(session_id=None, stream_id=None, stream_sequence=0, session_operator=False)
         return session
 
     @contextmanager
     def session(self, lifetime_wall_s: float | None = None, takeover: bool = False) -> Iterator[Session]:
         """Hold the control session for a block: acquired on the way in, released on the way out, however the
         block ends, so an error in the block does not leave the robot held."""
-        session = self.open_session(lifetime_wall_s, takeover)
+        headers = self._headers(operator=takeover)
+        session = self._acquire_session(lifetime_wall_s, None, headers, takeover=takeover)
         try:
+            self._remember_session(session, takeover)
             yield session
         finally:
-            self.close_session()
+            self._release_session(session.session_id, headers)
 
     # -- finite goals -----------------------------------------------------
 
@@ -696,8 +701,11 @@ class RobotClient:
         params: dict[str, Any] | None = None,
         operator: bool | None = None,
         timeout_s: float | None = None,
+        headers: dict[str, str] | None = None,
     ) -> M:
-        response = self._send(method, path, body=body, params=params, operator=operator, timeout_s=timeout_s)
+        response = self._send(
+            method, path, body=body, params=params, operator=operator, timeout_s=timeout_s, headers=headers
+        )
         try:
             return result.model_validate_json(response.content)
         except ValidationError as error:
@@ -718,6 +726,7 @@ class RobotClient:
         params: dict[str, Any] | None = None,
         operator: bool | None = None,
         timeout_s: float | None = None,
+        headers: dict[str, str] | None = None,
     ) -> httpx.Response:
         """Send one request, repeating it unchanged if the connection fails.
 
@@ -728,7 +737,7 @@ class RobotClient:
         to hear of it.
         """
         content = body.model_dump_json(exclude_none=True) if body is not None else None
-        headers = self._headers(operator)
+        headers = self._headers(operator) if headers is None else headers.copy()
         if content is not None:
             headers["Content-Type"] = "application/json"
         patience = self._timeout_s if timeout_s is None else timeout_s
