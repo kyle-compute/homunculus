@@ -9,7 +9,8 @@ it. It maps five profiles onto the motor controls the simulator offers over HTTP
     base.planar_velocity/1 (timed goal)   ->  repeated `step` actions with base_velocity,
                                               judged against the base velocity the task measures;
                                               with hands_follow_base, each step also carries both
-                                              hand targets with the measured base
+                                              hand targets with the measured base, and so does the
+                                              fallback when such a goal fails or is stopped
     gripper.width/1 on the left gripper   ->  one `grip` action
     gripper.grasp/1 on the left gripper   ->  one `grip` action to closed, judged on the gap the jaws stop at
     tool.pose.linear/1 on either hand     ->  repeated `step` actions with a hand target moving along
@@ -195,7 +196,8 @@ TRACKING = {
 ZERO_VELOCITY = {"forward_m_s": 0.0, "left_m_s": 0.0, "yaw_rate_rad_s": 0.0}
 FOLLOW_NOTE = (
     "; while it walks, both hand targets move and turn with the measured base, so the hands keep their pose "
-    "relative to it, as when carrying something in both hands, and the goal ends once the arms are at rest too"
+    "relative to it, as when carrying something in both hands, and the goal ends once the arms are at rest too; "
+    "if the goal fails or is stopped, the hands keep those targets, not the poses they are measured at"
 )
 # Passed through to the simulator when set: the task's own settings, and what its libraries need.
 SIMULATOR_ENV = ("SCENE_SEED", "POSE_JITTER", "RENDER_BACKEND", "MUJOCO_GL", "PATH", "TMPDIR")
@@ -229,7 +231,10 @@ def robots(
 
     `hands_follow_base=true`: a base goal also carries both hand targets with the measured base, so the hands keep
     their pose relative to it while it walks, as when carrying something in both hands. Otherwise they stay where
-    they are in the world.
+    they are in the world. When such a goal fails or is stopped, the arms keep their carried targets (still
+    carried with the base while it comes to rest) instead of holding where they are measured: they were holding
+    those targets, not reaching for them, and a loaded arm measured where it sags would let its load sink and turn
+    with every failed step.
 
     `arm_still_m`: how far a hand's tool site may move in one 0.05 s step while its arm counts as at rest, which
     confirms that a stopped arm holds still. Arms whose controller trembles under a load need more than the
@@ -348,6 +353,8 @@ class TaskBackend(Backend):
         self._reachable = False  # true while the simulator's latest answer was a successful one
         self._activities: dict[str, ActivityStatus] = {}
         self._owner: dict[str, str] = {}  # resource id -> activity commanding it
+        # Base goals that carry the hand targets (hands_follow_base): activity id -> the carrier its steps use.
+        self._carriers: dict[str, Callable[[dict[str, Any]], dict[str, Any]]] = {}
         self._cancelled: set[str] = set()
         self._closing = threading.Event()
         self._commands: queue.Queue[Callable[[], None] | None] = queue.Queue()
@@ -660,6 +667,8 @@ class TaskBackend(Backend):
             # Stopping one resource of a goal that owns several stops the goal, so all of them come to rest.
             stopped = {self._owner[rid] for rid in resources if rid in self._owner}
             resources = list(dict.fromkeys([*resources, *(r for r, a in self._owner.items() if a in stopped)]))
+            # A stopped base goal that carried the hand targets keeps carrying them while the base comes to rest.
+            carry = next((self._carriers.pop(a) for a in stopped if a in self._carriers), None)
             for rid in resources:
                 activity_id = self._owner.pop(rid, None)
                 if activity_id is not None:
@@ -669,7 +678,7 @@ class TaskBackend(Backend):
                     self._settled[rid] = False  # until the fallback queued below measures rest
             if self._finished:
                 return  # a finished episode never steps again: what was measured before it ended stands
-        self._commands.put(lambda: self._fallback(list(resources)))
+        self._commands.put(lambda: self._fallback(list(resources), carry=carry))
 
     def manage(self, operation: str, parameters: dict[str, Any]) -> dict[str, Any] | Future[dict[str, Any]]:
         if operation == "recover":
@@ -738,6 +747,7 @@ class TaskBackend(Backend):
             self._cancelled.update(self._owner.values())
             self._owner.clear()
             self._activities.clear()
+            self._carriers.clear()
         self._commands.put(finish)
         return result
 
@@ -832,6 +842,7 @@ class TaskBackend(Backend):
             for activity_id, status in list(self._activities.items()):
                 if status.phase == "done":  # reported once; its resource then holds what it reached
                     del self._activities[activity_id]
+                    self._carriers.pop(activity_id, None)
                     self._owner = {rid: owner for rid, owner in self._owner.items() if owner != activity_id}
             return feedback
 
@@ -880,6 +891,8 @@ class TaskBackend(Backend):
         with self._lock:
             cancelled = activity_id in self._cancelled or self._closing.is_set()
             self._cancelled.discard(activity_id)
+            if cancelled:
+                self._carriers.pop(activity_id, None)
             return cancelled
 
     def _report(self, activity_id: str, status: ActivityStatus) -> None:
@@ -895,6 +908,9 @@ class TaskBackend(Backend):
         seconds = max(STEP_MIN_S, action.duration_s / count)
         command = [action.forward_m_s, action.left_m_s, action.yaw_rate_rad_s]
         carry = self._carrier() if self._follows else None
+        if carry is not None:
+            with self._lock:
+                self._carriers[activity_id] = carry  # for the fallback, if this goal fails or is stopped
         try:
             for _ in range(count):
                 if self._skip(activity_id):
@@ -1126,14 +1142,17 @@ class TaskBackend(Backend):
         status.measurements.update(touch_normal_force_N=hand["touch_normal_force_N"], at_rest=rested >= SETTLE_S)
         self._report(activity_id, status)
 
-    def _fallback(self, resources: Sequence[str]) -> None:
+    def _fallback(
+        self, resources: Sequence[str], carry: Callable[[dict[str, Any]], dict[str, Any]] | None = None
+    ) -> None:
         """What stop() queues: no travel, the gripper held where it is measured to be, and each arm held at its
-        hand's measured pose."""
+        hand's measured pose; or, given the carrier of a stopped base goal that carried the hand targets, both arms
+        held at their carried targets, still carried with the base while it comes to rest."""
         with self._lock:
             if self._finished:
                 return
         try:
-            rested, _ = self._rest(resources, hold_measured=True)
+            rested, _ = self._rest(resources, hold_measured=True, carry=carry)
             settled = rested >= SETTLE_S
         except _Refused as refusal:  # a fallen robot or a finished episode accepts no further motion
             log.warning("the task simulator refused the fallback: %s", refusal)
@@ -1155,7 +1174,8 @@ class TaskBackend(Backend):
         "done" from the robot state after a step; give up after SETTLE_LIMIT_S. Returns how long the resources
         were last measured at rest, and `until`'s last decision.
 
-        hold_measured: first set the left gripper and the arms among `resources` to hold where they are measured.
+        hold_measured: first set the left gripper and the arms among `resources` to hold where they are measured
+        (arms that `carry` commands hold their carried targets instead).
         The jaws are never set wider than they were asked to be: jaws stopped on an object keep squeezing it,
         since a position-controlled gripper held at its measured gap presses with no force and drops what it holds.
         The base is at rest when the task reports a stable stand; a gripper, hand or arm when it stops moving.
@@ -1170,7 +1190,7 @@ class TaskBackend(Backend):
                 request["openings"] = {"left": min(1.0, left["requested_opening"], left["gap_m"] / MAX_GAP_M)}
             hands = {}
             for side in SIDES:
-                if f"{side}_arm" in resources:
+                if f"{side}_arm" in resources and carry is None:
                     pose = _tool_pose(before["hands"][side])
                     with self._lock:
                         self._hand_target[side] = pose

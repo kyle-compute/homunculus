@@ -1538,6 +1538,69 @@ def test_a_base_goal_with_hands_following_carries_both_hand_targets_with_the_bas
         assert [qx, qy, qz, w] == pytest.approx([0.0, 0.0, math.sin(math.pi / 4), math.cos(math.pi / 4)], abs=1e-9)
 
 
+def test_a_failed_base_goal_with_hands_following_keeps_the_carried_hand_targets(tmp_path, monkeypatch):
+    state = task_state()
+    hands, robot = state["robot"]["hands"], state["robot"]
+    hands["left"] = {**hands["left"], "position": [0.3, 0.2, 0.87]}
+    hands["right"] = {**hands["right"], "position": [0.3, -0.2, 0.87]}
+    sent = []
+
+    def simulator(request):
+        if request.url.path == "/health":
+            return httpx.Response(200, json={"ready": True})
+        if request.method == "POST":
+            body = json.loads(request.content)
+            dt = body.get("seconds", 0.0)
+            x, y, yaw = robot["base_xy_yaw"]  # a loaded base that turns at a fifth of its command
+            robot["base_xy_yaw"] = [x, y, yaw + body.get("base_velocity", [0.0, 0.0, 0.0])[2] / 5 * dt]
+            for side, target in body.get("hands", {}).items():  # loaded arms that hang 3 cm below their targets
+                sent.append((side, target["position"]))
+                below = [target["position"][0], target["position"][1], target["position"][2] - 0.03]
+                hands[side] = {**hands[side], "position": below, "quaternion_wxyz": target["quaternion"]}
+            state["sim_time"] += dt
+        return httpx.Response(200, json=state)
+
+    client = httpx.Client(transport=httpx.MockTransport(simulator), base_url="http://simulator")
+    monkeypatch.setattr(httpx, "Client", lambda **_: client)
+    backend = lambda _: TaskBackend("test", "http://simulator", epoch="test", hands_follow_base=True)  # noqa: E731
+    with Harness(tmp_path / "journal.sqlite", "task", backend=backend) as task:
+        task.open()
+        # Hold the hands 3 cm above where they hang, as a client lifting a load would.
+        for side in ("left", "right"):
+            p = hands[side]["position"]
+            task.backend._hand_target[side] = {
+                "frame_id": "world",
+                "position_m": [p[0], p[1], 0.9],
+                "orientation_xyzw": [0.0, 0.0, 0.0, 1.0],
+            }
+        action = BaseVelocityGoal(
+            profile="base.planar_velocity/1",
+            target="base",
+            forward_m_s=0.0,
+            left_m_s=0.0,
+            yaw_rate_rad_s=0.4,
+            duration_s=4.0,
+        )
+        goal = task.submit(action)
+        deadline = time.monotonic() + 10
+        while (goal := task.runtime.goal(goal.goal_id)).state not in ("succeeded", "failed", "cancelled"):
+            assert time.monotonic() < deadline
+            task.run(STEP)
+            time.sleep(0.002)
+        retained = {side: task.resource(f"{side}_arm").retained for side in ("left", "right")}
+    assert (goal.state, goal.result.reason) == ("failed", "tracking_error"), goal
+    # The base turned part of the way; after the failure each hand target is still carried with it, at the height
+    # it was held at, not where the loaded hand was measured.
+    _, _, yaw = robot["base_xy_yaw"]
+    assert 0.1 < yaw < 1.0
+    for side, beside in (("left", 0.2), ("right", -0.2)):
+        carried = [0.3 * math.cos(yaw) - beside * math.sin(yaw), 0.3 * math.sin(yaw) + beside * math.cos(yaw), 0.9]
+        assert retained[side].kind == "fallback"
+        target = retained[side].target
+        assert [target["x_m"], target["y_m"], target["z_m"]] == pytest.approx(carried, abs=1e-9)
+        assert [p for s, p in sent if s == side][-1] == pytest.approx(carried, abs=1e-9)
+
+
 def test_a_task_option_out_of_range_is_refused_before_anything_starts():
     with pytest.raises(StartupError, match="hands_follow_base is true or false"):
         task_robots(url="http://simulator", name="test", hands_follow_base="yes")
