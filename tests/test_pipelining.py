@@ -3,17 +3,23 @@
 from __future__ import annotations
 
 import itertools
+import json
 import math
+import socket
+import threading
 from collections.abc import Callable, Iterator
 from concurrent.futures import Future
-from contextlib import ExitStack
+from contextlib import ExitStack, contextmanager
 from pathlib import Path
 
 import pytest
+import uvicorn
 from pydantic import ValidationError
 
 from homunculus import rigs
 from homunculus.backends.fake import FakeBackend
+from homunculus.cli import main as cli_main
+from homunculus.client import RobotClient, TargetStore
 from homunculus.journal import Journal
 from homunculus.models import (
     Authority,
@@ -32,6 +38,7 @@ from homunculus.models import (
 )
 from homunculus.profiles import JointReference
 from homunculus.runtime import Backend, Clock, Principal, Runtime
+from homunculus.server import Service, create_app
 
 CLIENT = Principal("client")
 OTHER = Principal("other")
@@ -725,3 +732,94 @@ def test_mujoco_panda_active_mid_motion_replace_is_continuous(panda: Harness):
     assert panda.runtime.goal(g2.goal_id).state == "succeeded"
     final = panda.runtime.observe()
     assert math.isclose(final.samples["arm"].values["positions"]["joint1"], -0.4, abs_tol=0.02)
+
+
+# --------------------------------------------------------------------------
+# Client & CLI opt-in flags (--after, --replace)
+# --------------------------------------------------------------------------
+
+
+class _ReadyServer(uvicorn.Server):
+    def __init__(self, config: uvicorn.Config) -> None:
+        super().__init__(config)
+        self.ready = threading.Event()
+
+    async def startup(self, sockets=None) -> None:
+        await super().startup(sockets=sockets)
+        self.ready.set()
+
+
+@contextmanager
+def _serving(service: Service) -> Iterator[str]:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+        listener.bind(("127.0.0.1", 0))
+        listener.listen()
+        server = _ReadyServer(uvicorn.Config(create_app(service), log_level="warning", timeout_graceful_shutdown=1))
+        thread = threading.Thread(target=server.run, kwargs={"sockets": [listener]})
+        thread.start()
+        try:
+            assert server.ready.wait(timeout=10.0)
+            yield f"http://127.0.0.1:{listener.getsockname()[1]}"
+        finally:
+            server.should_exit = True
+            thread.join(10.0)
+
+
+def test_client_and_cli_support_after_and_replace_with_unchanged_defaults(
+    arm: Harness, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+):
+    service = Service({"fake-arm": arm.runtime}, {"client-token": CLIENT}, "boot-00000001", ServiceLimits())
+    monkeypatch.setenv("HOMUNCULUS_HOME", str(tmp_path / "home"))
+    with _serving(service) as url:
+        assert cli_main(["connect", url, "--token", "client-token"]) == 0
+        assert cli_main(["use", "fake:arm"]) == 0
+        capsys.readouterr()
+
+        # Default describe text has no queued annotation when nothing is queued.
+        assert cli_main(["describe"]) == 0
+        default_describe = capsys.readouterr().out
+        assert "queued:" not in default_describe
+
+        # Open session via RobotClient, verify submit_goal after_goal_id & replace_goal_id over HTTP.
+        arm.runtime.close_session(CLIENT, arm.session)
+        assert cli_main(["session", "open"]) == 0
+        capsys.readouterr()
+
+        assert cli_main(["--json", "goal", "joints", "joint1=0.4", "--duration", "1.0"]) == 0
+        g1_id = json.loads(capsys.readouterr().out)["goal_id"]
+        arm.run(0.1)
+
+        # Dry-run validate with --after works through CLI.
+        assert cli_main(["goal", "joints", "joint1=0.8", "--duration", "1.0", "--after", g1_id, "--dry-run"]) == 0
+        capsys.readouterr()
+
+        # Queue g2 via CLI --after and verify describe shows queued.
+        assert cli_main(["--json", "goal", "joints", "joint1=0.8", "--duration", "1.0", "--after", g1_id]) == 0
+        g2_doc = json.loads(capsys.readouterr().out)
+        g2_id = g2_doc["goal_id"]
+        assert g2_doc["contract"]["after_goal_id"] == g1_id
+
+        assert cli_main(["describe"]) == 0
+        queued_describe = capsys.readouterr().out
+        assert f"queued: {g2_id}" in queued_describe
+
+        # Replace queued g2 via CLI --replace.
+        assert cli_main(["--json", "goal", "joints", "joint1=-0.2", "--duration", "1.0", "--replace", g2_id]) == 0
+        g2_new = json.loads(capsys.readouterr().out)
+        assert g2_new["contract"]["replace_goal_id"] == g2_id
+        assert g2_new["contract"]["after_goal_id"] == g1_id
+
+        # Giving both --after and --replace is refused cleanly by CLI parser.
+        with pytest.raises(SystemExit) as bad_cli:
+            cli_main(["goal", "joints", "joint1=0.0", "--after", g1_id, "--replace", g2_id])
+        assert bad_cli.value.code == 2
+        capsys.readouterr()
+
+        # Also test RobotClient.submit_goal(replace_goal_id=...) mid-motion directly over HTTP.
+        with RobotClient(TargetStore().get("fake:arm")) as client:
+            arm.run(0.4)  # g1 moving
+            g_redirect = client.submit_goal(move_joint1(-0.5, at=1.5), replace_goal_id=g1_id)
+            assert g_redirect.contract.replace_goal_id == g1_id
+            arm.run(2.5)
+            assert client.goal(g1_id).result.reason == "superseded"
+            assert client.goal(g_redirect.goal_id).state == "succeeded"

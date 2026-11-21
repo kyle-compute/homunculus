@@ -491,6 +491,8 @@ class RobotClient:
         max_execution_s: float | None = None,
         max_wall_s: float | None = None,
         start_conditions: StartConditions | None = None,
+        after_goal_id: str | None = None,
+        replace_goal_id: str | None = None,
         session_id: str | None = None,
         context_id: str | None = None,
     ) -> Goal:
@@ -507,6 +509,8 @@ class RobotClient:
             max_wall_s=max_wall_s,
             action=action,
             start_conditions=start_conditions,
+            after_goal_id=after_goal_id,
+            replace_goal_id=replace_goal_id,
         )
         goal = self._call("POST", "/goals", Goal, body=request)
         self._record(goal_id=goal.goal_id)
