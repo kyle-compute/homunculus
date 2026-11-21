@@ -26,7 +26,7 @@ from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from functools import wraps
 from threading import Lock
-from typing import Any, Concatenate, Literal, get_args
+from typing import Any, Concatenate, Literal, Protocol, get_args, runtime_checkable
 
 from .models import (
     BaseVelocityGoal,
@@ -505,6 +505,25 @@ class MotionJudge:
             return self._status
 
 
+@runtime_checkable
+class JointPathJudge(Protocol):
+    """Any joint-space judge driven by a time-parameterized (position, velocity) reference."""
+
+    @property
+    def status(self) -> ActivityStatus | None: ...
+
+    @property
+    def joints(self) -> Sequence[str]: ...
+
+    def reference(self, elapsed: float) -> tuple[list[float], list[float]]: ...
+
+    def end_positions(self) -> dict[str, float]: ...
+
+    def update(
+        self, elapsed: float, positions: Sequence[float], velocities: Sequence[float], dt: float
+    ) -> ActivityStatus: ...
+
+
 def measures[J: MotionJudge, **P](
     update: Callable[Concatenate[J, P], ActivityStatus],
 ) -> Callable[Concatenate[J, P], ActivityStatus]:
@@ -531,6 +550,16 @@ class TrajectoryJudge(MotionJudge):
         self.action, self.limits = action, limits
         self.settled_for = 0.0
         self.peak_error = 0.0
+
+    @property
+    def joints(self) -> Sequence[str]:
+        return self.action.joints
+
+    def reference(self, elapsed: float) -> tuple[list[float], list[float]]:
+        return sample_trajectory(self.action.points, elapsed)
+
+    def end_positions(self) -> dict[str, float]:
+        return dict(zip(self.action.joints, self.action.points[-1].positions, strict=True))
 
     @measures
     def update(

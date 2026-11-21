@@ -39,6 +39,7 @@ from homunculus.models import (
 from homunculus.profiles import JointReference
 from homunculus.runtime import Backend, Clock, Principal, Runtime
 from homunculus.server import Service, create_app
+from homunculus.smooth import JointSmoothGoal
 
 CLIENT = Principal("client")
 OTHER = Principal("other")
@@ -823,3 +824,121 @@ def test_client_and_cli_support_after_and_replace_with_unchanged_defaults(
             arm.run(2.5)
             assert client.goal(g1_id).result.reason == "superseded"
             assert client.goal(g_redirect.goal_id).state == "succeeded"
+
+
+# --------------------------------------------------------------------------
+# Registered profile plugin: joints.smooth/1
+# --------------------------------------------------------------------------
+
+
+@pytest.fixture
+def smooth_arm(tmp_path: Path) -> Iterator[Harness]:
+    with Harness(
+        tmp_path / "smooth_arm.sqlite",
+        "fake-arm",
+        make_backend=lambda clock: FakeBackend("arm", clock, smooth=True),
+    ) as harness:
+        harness.open()
+        yield harness
+
+
+@pytest.fixture
+def smooth_panda(tmp_path: Path) -> Iterator[Harness]:
+    mujoco_backend = pytest.importorskip("homunculus.backends.mujoco")
+    folder = rigs.find("panda")
+    with Harness(
+        tmp_path / "smooth_panda.sqlite",
+        "panda",
+        make_backend=lambda clock: mujoco_backend.MujocoBackend(clock, folder, smooth=True),
+    ) as harness:
+        harness.open()
+        yield harness
+
+
+def test_smooth_profile_roundtrips_through_goal_spec_and_is_opt_in(arm: Harness, smooth_arm: Harness):
+    assert "joints.smooth/1" not in {b.profile for b in arm.runtime.describe().profiles}
+    assert "joints.smooth/1" in {b.profile for b in smooth_arm.runtime.describe().profiles}
+
+    wire = {"profile": "joints.smooth/1", "target": "arm", "positions": {"joint1": 0.6}, "speed_scale": 0.5}
+    spec = GoalSpec.model_validate({"action": wire})
+    assert isinstance(spec.action, JointSmoothGoal)
+    assert GoalSpec.model_validate_json(spec.model_dump_json()) == spec
+
+
+def test_smooth_auto_timed_motion_speed_scale_and_limits(smooth_arm: Harness):
+    fast = smooth_arm.submit(
+        JointSmoothGoal(profile="joints.smooth/1", target="arm", positions={"joint1": 1.0}, speed_scale=1.0)
+    )
+    smooth_arm.run(3.0)
+    fast_done = smooth_arm.runtime.goal(fast.goal_id)
+    assert fast_done.state == "succeeded"
+
+    slow = smooth_arm.submit(
+        JointSmoothGoal(profile="joints.smooth/1", target="arm", positions={"joint1": 0.0}, speed_scale=0.5)
+    )
+    smooth_arm.run(4.0)
+    slow_done = smooth_arm.runtime.goal(slow.goal_id)
+    assert slow_done.state == "succeeded"
+    assert slow_done.result.measurements["duration_s"] > fast_done.result.measurements["duration_s"] * 1.4
+
+    # Out-of-range position and unknown joint are refused at admission.
+    with pytest.raises(RobotError) as bad_pos:
+        smooth_arm.submit(JointSmoothGoal(profile="joints.smooth/1", target="arm", positions={"joint1": 9.0}))
+    assert bad_pos.value.code == "limit_exceeded"
+    with pytest.raises(RobotError) as bad_joint:
+        smooth_arm.submit(JointSmoothGoal(profile="joints.smooth/1", target="arm", positions={"elbow99": 0.0}))
+    assert bad_joint.value.code == "unsupported_parameter"
+
+
+def test_smooth_blocked_arm_fails_from_measurements_and_cancels_queue(smooth_arm: Harness):
+    g1 = smooth_arm.submit(
+        JointSmoothGoal(profile="joints.smooth/1", target="arm", positions={"joint1": 1.0}, speed_scale=0.8)
+    )
+    smooth_arm.run(0.1)
+    g2 = smooth_arm.submit(
+        JointSmoothGoal(profile="joints.smooth/1", target="arm", positions={"joint1": 0.2}, speed_scale=0.8),
+        after_goal_id=g1.goal_id,
+    )
+    smooth_arm.backend.faults.add(("blocked", "arm"))
+    smooth_arm.run(2.0)
+
+    done1 = smooth_arm.runtime.goal(g1.goal_id)
+    assert done1.state == "failed"
+    assert done1.result.reason == "path_tolerance_violated"
+    done2 = smooth_arm.runtime.goal(g2.goal_id)
+    assert done2.state == "cancelled"
+    assert done2.result.reason == "predecessor_failed"
+
+
+def test_mujoco_panda_smooth_mid_motion_reversal_and_queued_followup(smooth_panda: Harness):
+    g1 = smooth_panda.submit(
+        JointSmoothGoal(
+            profile="joints.smooth/1", target="arm", positions={"joint1": 1.0, "joint4": -1.1}, speed_scale=0.8
+        )
+    )
+    smooth_panda.run(0.45)
+    obs_mid = smooth_panda.runtime.observe()
+    assert obs_mid.samples["arm"].values["velocities"]["joint1"] > 0.3
+
+    # Redirect mid-flight with no duration guessing, and queue a follow-up right behind it!
+    g2 = smooth_panda.submit(
+        JointSmoothGoal(
+            profile="joints.smooth/1", target="arm", positions={"joint1": -0.5, "joint4": -2.0}, speed_scale=0.8
+        ),
+        replace_goal_id=g1.goal_id,
+    )
+    g3 = smooth_panda.submit(
+        JointSmoothGoal(
+            profile="joints.smooth/1", target="arm", positions={"joint1": 0.2, "joint4": -1.57}, speed_scale=0.8
+        ),
+        after_goal_id=g2.goal_id,
+    )
+
+    smooth_panda.run(6.0)
+    assert smooth_panda.runtime.goal(g1.goal_id).state == "cancelled"
+    assert smooth_panda.runtime.goal(g1.goal_id).result.reason == "superseded"
+    assert smooth_panda.runtime.goal(g2.goal_id).state == "succeeded"
+    assert smooth_panda.runtime.goal(g3.goal_id).state == "succeeded"
+    final = smooth_panda.runtime.observe()
+    assert math.isclose(final.samples["arm"].values["positions"]["joint1"], 0.2, abs_tol=0.02)
+    assert math.isclose(final.samples["arm"].values["positions"]["joint4"], -1.57, abs_tol=0.02)
