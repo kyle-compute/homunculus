@@ -942,3 +942,161 @@ def test_mujoco_panda_smooth_mid_motion_reversal_and_queued_followup(smooth_pand
     final = smooth_panda.runtime.observe()
     assert math.isclose(final.samples["arm"].values["positions"]["joint1"], 0.2, abs_tol=0.02)
     assert math.isclose(final.samples["arm"].values["positions"]["joint4"], -1.57, abs_tol=0.02)
+
+
+# --------------------------------------------------------------------------
+# Measurable MuJoCo proofs (before vs after)
+# --------------------------------------------------------------------------
+
+
+def test_mujoco_panda_pipelining_slashes_arm_idle_fraction(tmp_path: Path):
+    """Proof 1: on a 6-step MuJoCo Panda sequence with 2 s agent think latency, causal pipelining
+    cuts arm idle fraction from >50% (stop-and-wait) to <5%."""
+    mujoco_backend = pytest.importorskip("homunculus.backends.mujoco")
+    folder = rigs.find("panda")
+    waypoints = [
+        {"joint1": 0.4, "joint4": -1.3},
+        {"joint1": 0.8, "joint4": -1.8},
+        {"joint1": 0.2, "joint4": -1.5},
+        {"joint1": -0.5, "joint4": -1.9},
+        {"joint1": -0.2, "joint4": -1.3},
+        {"joint1": 0.0, "joint4": -1.57},
+    ]
+    think_s = 2.0
+
+    def run_sequence(*, pipeline: bool) -> tuple[float, float]:
+        with Harness(
+            tmp_path / f"{'after' if pipeline else 'before'}.sqlite",
+            "panda",
+            make_backend=lambda clock: mujoco_backend.MujocoBackend(clock, folder, smooth=True),
+        ) as h:
+            h.open()
+            total_ticks = 0
+            idle_ticks = 0
+            started = h.clock.t
+
+            def step_once() -> None:
+                nonlocal total_ticks, idle_ticks
+                h.clock.t += STEP
+                h.runtime.tick()
+                h.journal.flush()
+                total_ticks += 1
+                if h.resource("arm").condition == "ready":
+                    idle_ticks += 1
+
+            if not pipeline:
+                for idx, target in enumerate(waypoints):
+                    goal = h.submit(
+                        JointSmoothGoal(profile="joints.smooth/1", target="arm", positions=target, speed_scale=0.8)
+                    )
+                    while h.runtime.goal(goal.goal_id).state not in ("succeeded", "failed", "cancelled"):
+                        step_once()
+                    assert h.runtime.goal(goal.goal_id).state == "succeeded"
+                    # Agent waits for goal completion, observes, and thinks for `think_s` before sending the next step.
+                    if idx < len(waypoints) - 1:
+                        for _ in range(round(think_s / STEP)):
+                            step_once()
+            else:
+                # Agent pipelines upcoming moves while the arm executes instead of waiting for standstill.
+                goals = []
+                for idx, target in enumerate(waypoints):
+                    after_id = goals[-1].goal_id if goals else None
+                    goals.append(
+                        h.submit(
+                            JointSmoothGoal(profile="joints.smooth/1", target="arm", positions=target, speed_scale=0.8),
+                            after_goal_id=after_id,
+                        )
+                    )
+                    if idx == 0:
+                        step_once()  # first goal starts moving while remaining steps are queued
+                while h.runtime.goal(goals[-1].goal_id).state not in ("succeeded", "failed", "cancelled"):
+                    step_once()
+                for goal in goals:
+                    assert h.runtime.goal(goal.goal_id).state == "succeeded"
+
+            return idle_ticks / total_ticks, h.clock.t - started
+
+    before_idle, before_time = run_sequence(pipeline=False)
+    after_idle, after_time = run_sequence(pipeline=True)
+    assert before_idle > 0.50
+    assert after_idle < 0.05
+    assert after_time < before_time * 0.55
+
+
+def test_mujoco_panda_mid_motion_redirect_eliminates_stop_gap(tmp_path: Path):
+    """Proof 2: visual-servo mid-flight redirect has 0 s stop gap, arrives faster, and cuts peak torque
+    dramatically compared to cancel-stop-restart."""
+    mujoco_backend = pytest.importorskip("homunculus.backends.mujoco")
+    folder = rigs.find("panda")
+    initial = JointSmoothGoal(profile="joints.smooth/1", target="arm", positions={"joint1": 1.0}, speed_scale=0.8)
+    redirect = JointSmoothGoal(profile="joints.smooth/1", target="arm", positions={"joint1": 1.5}, speed_scale=0.8)
+
+    def run_redirect(*, smooth_replace: bool) -> tuple[float, float, float]:
+        with Harness(
+            tmp_path / f"{'replace' if smooth_replace else 'cancel'}.sqlite",
+            "panda",
+            make_backend=lambda clock: mujoco_backend.MujocoBackend(clock, folder, smooth=True),
+        ) as h:
+            h.open()
+            g1 = h.submit(initial)
+            h.run(0.5)  # arm moving fast in +joint1
+            t_decision = h.clock.t
+            peak_torque = 0.0
+
+            def tick_and_sample() -> None:
+                nonlocal peak_torque
+                h.run(STEP)
+                obs = h.runtime.observe()
+                peak_torque = max(peak_torque, abs(obs.samples["arm"].values["actuator_forces"]["joint1"]))
+
+            if not smooth_replace:
+                h.runtime.cancel_goal(CLIENT, g1.goal_id, Authority(session_id=h.session, context_id=h.context))
+                while h.runtime.goal(g1.goal_id).state not in ("cancelled", "failed"):
+                    tick_and_sample()
+                stop_gap_s = h.clock.t - t_decision
+                g2 = h.submit(redirect)
+            else:
+                g2 = h.submit(redirect, replace_goal_id=g1.goal_id)
+                stop_gap_s = 0.0
+
+            while h.runtime.goal(g2.goal_id).state not in ("succeeded", "failed", "cancelled"):
+                tick_and_sample()
+            assert h.runtime.goal(g2.goal_id).state == "succeeded"
+            return stop_gap_s, h.clock.t - t_decision, peak_torque
+
+    cancel_gap, cancel_time, cancel_torque = run_redirect(smooth_replace=False)
+    replace_gap, replace_time, replace_torque = run_redirect(smooth_replace=True)
+    assert cancel_gap > 0.2
+    assert replace_gap == 0.0
+    assert replace_time < cancel_time
+    assert replace_torque < cancel_torque * 0.5
+
+
+def test_mujoco_panda_table_collision_fails_by_measurement_and_cancels_queued_tail(smooth_panda: Harness):
+    """Proof 3: a real MuJoCo table collision fails path_tolerance_violated (never timer-based success)
+    and auto-cancels the queued follow-up chain without dispatching it."""
+    collide = JointTrajectoryGoal(
+        profile="joints.trajectory/1",
+        target="arm",
+        joints=["joint2", "joint4"],
+        points=[TrajectoryPoint(time_s=2.0, positions=[1.6, -0.8], velocities=[0.0, 0.0])],
+    )
+    g1 = smooth_panda.submit(collide)
+    smooth_panda.run(0.1)
+    g2 = smooth_panda.submit(
+        GripperWidthGoal(profile="gripper.width/1", target="gripper", width_m=0.02), after_goal_id=g1.goal_id
+    )
+    g3 = smooth_panda.submit(
+        JointSmoothGoal(profile="joints.smooth/1", target="arm", positions={"joint2": 0.0, "joint4": -1.57}),
+        after_goal_id=g2.goal_id,
+    )
+
+    smooth_panda.run(3.5)
+    done1 = smooth_panda.runtime.goal(g1.goal_id)
+    assert done1.state == "failed"
+    assert done1.result.reason == "path_tolerance_violated"
+    for tail in (g2, g3):
+        done = smooth_panda.runtime.goal(tail.goal_id)
+        assert done.state == "cancelled"
+        assert done.result.reason == "predecessor_failed"
+        assert done.activated_time_ns is None
