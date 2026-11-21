@@ -22,7 +22,7 @@ import threading
 import time
 from abc import ABC, abstractmethod
 from collections import OrderedDict, deque
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from concurrent.futures import Future
 from dataclasses import dataclass, field
 from typing import Any, ClassVar, Literal, NoReturn, Protocol, Self
@@ -282,7 +282,7 @@ class _GoalEvaluation:
 class _GoalRecord:
     goal: Goal
     wall_deadline: float
-    execution_deadline: float
+    execution_deadline: float | None
     ending: _Ending | None = None
     dispatch_write: Future[None] | None = None
     evaluation: _GoalEvaluation | None = None
@@ -427,7 +427,12 @@ class Runtime:
 
             # Memory is bounded here and nowhere else. Ending a goal or stream never removes a record, so
             # the loops that end them (a stop, a session ending, a barrier) can walk these tables safely.
-            self._trim(self._goals, lambda r: r.goal.state in TERMINAL_GOAL_STATES)
+            referenced = {
+                r.goal.contract.after_goal_id
+                for r in self._goals.values()
+                if r.goal.state == "accepted" and r.goal.contract.after_goal_id is not None
+            }
+            self._trim(self._goals, lambda r: r.goal.state in TERMINAL_GOAL_STATES and r.goal.goal_id not in referenced)
             self._trim(self._streams, lambda r: r.stream.state == "closed")
             self._trim(self._operations, lambda op: op.state != "running")
 
@@ -495,7 +500,7 @@ class Runtime:
                 clocks=[host_clock, *facts.clocks],
                 frames=facts.frames,
                 sensors=facts.sensors,
-                resources=[r.status.model_copy(deep=True) for r in self._resources.values()],
+                resources=self._resource_statuses(),
                 profiles=[self._availability(binding) for binding in facts.bindings],
                 concurrent_groups=facts.concurrent,
                 management=facts.management,
@@ -593,6 +598,17 @@ class Runtime:
         with self._lock:
             return self._history.events(after)
 
+    def _resource_statuses(self) -> list[ResourceStatus]:
+        """Snapshot every resource with its derived queue of accepted-but-waiting goals."""
+        queued: dict[str, list[str]] = {rid: [] for rid in self._resources}
+        for record in self._goals.values():
+            goal = record.goal
+            if goal.state == "accepted":
+                for rid in goal.contract.resources:
+                    if self._resources[rid].status.activity != goal.goal_id:
+                        queued[rid].append(goal.goal_id)
+        return [r.status.model_copy(deep=True, update={"queued": queued[rid]}) for rid, r in self._resources.items()]
+
     def _issue(self, now: float, images: Sequence[ImageHandle] = ()) -> Observation:
         return self._history.issue(
             context_id=self.context_id,
@@ -600,7 +616,7 @@ class Runtime:
             measured_at=self._feedback_time,
             state_sequence=self._state_sequence,
             samples=self._feedback.samples,
-            resources=[r.status.model_copy(deep=True) for r in self._resources.values()],
+            resources=self._resource_statuses(),
             images=images,
         )
 
@@ -790,7 +806,7 @@ class Runtime:
         }.get(state, ("cancelled", reason))
         for record in self._goals.values():
             if record.goal.session_id == public.session_id and record.goal.state not in TERMINAL_GOAL_STATES:
-                self._end_goal(record, _Ending(goal_state, goal_reason), now)
+                self._end_goal(record, _Ending(goal_state, goal_reason), now, cascade=False)
         for stream in self._streams.values():
             if stream.stream.session_id == public.session_id and stream.stream.state == "open":
                 self._end_stream(stream, "interrupted", now, goal_reason)
@@ -822,8 +838,10 @@ class Runtime:
             if (request.goal is None) == (request.stream is None):
                 raise RobotError("invalid_request", "give exactly one of goal or stream")
             if request.goal is not None:
+                now = self._clock.now()
                 contract = self._contract(request.goal)
-                self._check_start(contract, self._clock.now())
+                predecessor = self._predecessor(request.goal.after_goal_id) if request.goal.after_goal_id else None
+                self._check_start(contract, now, after=predecessor)
                 return Validation(resources=contract.resources, contract=contract)
             binding = find_binding(self._facts.bindings, request.stream.profile, request.stream.target, "stream")
             self._require_available(binding)
@@ -840,8 +858,28 @@ class Runtime:
                 self._expire(now)
                 self._authority(principal, request.session_id, request.context_id)
                 contract = self._contract(request)
-                self._check_start(contract, now)
-                self._check_free(contract.resources)
+                predecessor = (
+                    self._predecessor(request.after_goal_id, session_id=request.session_id)
+                    if request.after_goal_id is not None
+                    else None
+                )
+                waiting = predecessor is not None and predecessor.state not in TERMINAL_GOAL_STATES
+                if waiting:
+                    queued_count = sum(
+                        1
+                        for r in self._goals.values()
+                        if r.goal.state == "accepted"
+                        and r.goal.goal_id != self._resources[r.goal.contract.resources[0]].status.activity
+                    )
+                    if queued_count >= self._limits.max_queued_goals:
+                        raise RobotError(
+                            "limit_exceeded",
+                            f"at most {self._limits.max_queued_goals} goals may be queued at once",
+                            parameter="max_queued_goals",
+                            maximum=self._limits.max_queued_goals,
+                        )
+                self._check_start(contract, now, after=predecessor)
+                self._check_free(contract.resources, after=predecessor)
                 goal = Goal(
                     goal_id=_new_id("goal"),
                     request_id=request.request_id,
@@ -856,9 +894,9 @@ class Runtime:
                 # Identity and the resolved command are durable before any dispatch.
                 record = _GoalRecord(
                     goal,
-                    # Both deadlines start at admission; activation is recorded separately.
+                    # Wall deadline always starts at admission; execution deadline starts when head-of-line.
                     wall_deadline=now + contract.max_wall_s,
-                    execution_deadline=self._feedback.execution_time_s + contract.max_execution_s,
+                    execution_deadline=None if waiting else self._feedback.execution_time_s + contract.max_execution_s,
                 )
                 stop_generation = self._stop_generation
             self._admit(principal, "goal", goal.goal_id, request_id=request.request_id, request=body, document=goal)
@@ -869,8 +907,39 @@ class Runtime:
                 if reason := self._admission_interrupted(goal.context_id, stop_generation, goal.session_id):
                     self._finish_goal(record, "cancelled", reason, now)
                     return goal.model_copy(deep=True)
-                for rid in contract.resources:
-                    self._resources[rid].status.activity = goal.goal_id
+                claim = True
+                if contract.after_goal_id is not None:
+                    found = self._find_goal(contract.after_goal_id)
+                    if found is not None:
+                        pred_goal, pred_record = found
+                        if pred_goal.state in ("stopping", "failed", "cancelled", "interrupted"):
+                            pred_reason = self._goal_reason(pred_goal, pred_record)
+                            self._finish_goal(
+                                record,
+                                "cancelled",
+                                "predecessor_failed",
+                                now,
+                                detail=f"predecessor goal {contract.after_goal_id} ended {pred_goal.state}",
+                                measurements={
+                                    "predecessor_goal_id": contract.after_goal_id,
+                                    "predecessor_state": pred_goal.state,
+                                    "predecessor_reason": pred_reason,
+                                },
+                            )
+                            return goal.model_copy(deep=True)
+                        if pred_goal.state == "succeeded":
+                            if record.execution_deadline is None:
+                                record.execution_deadline = self._feedback.execution_time_s + contract.max_execution_s
+                            claim = all(
+                                self._resources[rid].status.activity is None
+                                and self._resources[rid].status.condition == "ready"
+                                for rid in contract.resources
+                            )
+                        else:
+                            claim = False
+                if claim:
+                    for rid in contract.resources:
+                        self._resources[rid].status.activity = goal.goal_id
                 self._history.emit("goal.accepted", now, goal_id=goal.goal_id, profile=contract.action.profile)
                 return goal.model_copy(deep=True)
 
@@ -938,17 +1007,100 @@ class Runtime:
             limits=binding.limits,
             stop_deadline_wall_s=binding.stop_deadline_wall_s,
             start_conditions=conditions,
+            after_goal_id=goal.after_goal_id,
             **deadlines,
         )
 
-    def _check_start(self, contract: Contract, now: float) -> Action:
+    def _find_goal(self, goal_id: str) -> tuple[Goal, _GoalRecord | None] | None:
+        record = self._goals.get(goal_id)
+        if record is not None:
+            return record.goal, record
+        if goal_id.startswith("goal-"):
+            outcome = self._journal.outcome(self.robot_id, goal_id)
+            if outcome is not None:
+                return Goal.model_validate(outcome), None
+        entry = self._journal.find(self.robot_id, goal_id)
+        if entry is None or entry.kind != "goal":
+            return None
+        return Goal.model_validate(entry.document), None
+
+    @staticmethod
+    def _goal_reason(goal: Goal, record: _GoalRecord | None = None) -> str | None:
+        if record is not None and record.ending is not None:
+            return record.ending.reason
+        return goal.result.reason if goal.result is not None else None
+
+    def _ancestor_chain(self, after: Goal | None) -> list[Goal]:
+        """Unfinished ancestors starting at `after` and walking up `after_goal_id`."""
+        chain: list[Goal] = []
+        cursor = after
+        while cursor is not None and cursor.state not in TERMINAL_GOAL_STATES:
+            chain.append(cursor)
+            parent_id = cursor.contract.after_goal_id
+            parent = self._goals.get(parent_id) if parent_id is not None else None
+            cursor = parent.goal if parent is not None else None
+        return chain
+
+    def _predecessor(self, goal_id: str, *, session_id: str | None = None) -> Goal:
+        found = self._find_goal(goal_id)
+        if found is None:
+            raise RobotError("start_condition_failed", f"unknown predecessor goal {goal_id!r}", after_goal_id=goal_id)
+        goal, record = found
+        if goal.context_id != self.context_id:
+            raise RobotError(
+                "start_condition_failed",
+                f"predecessor goal {goal_id!r} belongs to another context",
+                after_goal_id=goal_id,
+                context_id=goal.context_id,
+            )
+        if session_id is not None and goal.session_id != session_id:
+            raise RobotError(
+                "permission_denied",
+                "cannot queue after a goal belonging to another session",
+                after_goal_id=goal_id,
+            )
+        if goal.state in ("stopping", "failed", "cancelled", "interrupted"):
+            raise RobotError(
+                "start_condition_failed",
+                f"predecessor goal {goal_id!r} is {goal.state}",
+                after_goal_id=goal_id,
+                predecessor_state=goal.state,
+                predecessor_reason=self._goal_reason(goal, record),
+            )
+        return goal
+
+    def _expected_reading(self, rid: str, after: Goal) -> Reading | None:
+        """Predicted sample for `rid` after `after` and its unfinished ancestors succeed, or None if unknown."""
+        values: Mapping[str, Any] = self._feedback.samples[rid].values
+        t = self._feedback.execution_time_s
+        for goal in reversed(self._ancestor_chain(after)):
+            if rid not in goal.contract.resources:
+                continue
+            if goal.contract.resources[0] != rid:
+                return None
+            predicted = PROFILES[goal.contract.action.profile].expected_end(
+                goal.contract.action, goal.contract.limits, Reading(values, t)
+            )
+            if predicted is None:
+                return None
+            values = predicted
+        return Reading(values, t)
+
+    def _check_start(self, contract: Contract, now: float, *, after: Goal | None = None) -> Action:
         """Run at admission and again at dispatch: nothing starts on unmeasured or changed state.
 
         Returns the action as it would start now; a trajectory is bound to the measured joint state.
         """
         self._require_measured(contract.resources)
-        reading = Reading(self._feedback.samples[contract.resources[0]].values, self._feedback.execution_time_s)
-        action = PROFILES[contract.action.profile].activate(contract.action, contract.limits, reading)
+        queued = after is not None and after.state not in TERMINAL_GOAL_STATES
+        if queued:
+            reading = self._expected_reading(contract.resources[0], after)
+        else:
+            reading = Reading(self._feedback.samples[contract.resources[0]].values, self._feedback.execution_time_s)
+        if reading is not None:
+            action = PROFILES[contract.action.profile].activate(contract.action, contract.limits, reading)
+        else:
+            action = contract.action
         conditions = contract.start_conditions
         if conditions is None:
             return action
@@ -991,26 +1143,64 @@ class Runtime:
                         f"the source observation has no valid measurement of {rid!r} to bound how far it moved",
                         resource=rid,
                     )
-                after = sample.values["positions"]
-                moved = max((abs(after[name] - q) for name, q in before.values["positions"].items()), default=0.0)
-                if moved > conditions.max_position_change:
-                    raise RobotError(
-                        "start_condition_failed",
-                        f"{rid!r} moved {moved:.4f} since the source observation; the limit is "
-                        f"{conditions.max_position_change:g}",
-                        resource=rid,
-                        moved=moved,
-                        limit=conditions.max_position_change,
+                predicted = self._expected_reading(rid, after) if queued else None
+                if not queued or predicted is not None:
+                    after_positions = (predicted.values if predicted is not None else sample.values)["positions"]
+                    moved = max(
+                        (abs(after_positions[name] - q) for name, q in before.values["positions"].items()), default=0.0
                     )
+                    if moved > conditions.max_position_change:
+                        raise RobotError(
+                            "start_condition_failed",
+                            f"{rid!r} moved {moved:.4f} since the source observation; the limit is "
+                            f"{conditions.max_position_change:g}",
+                            resource=rid,
+                            moved=moved,
+                            limit=conditions.max_position_change,
+                        )
         return action
 
     def _activate(self, record: _GoalRecord, now: float) -> None:
-        """Recheck start conditions, then dispatch. A rejection here causes no movement."""
+        """Wait for any predecessor, recheck start conditions, then dispatch. A rejection causes no movement."""
         goal = record.goal
         contract = goal.contract
+        if now >= record.wall_deadline:
+            ending = _Ending(
+                "failed",
+                "precondition_changed",
+                "the wall deadline passed before dispatch",
+                {"code": "start_condition_failed"},
+            )
+            self._end_goal(record, ending, now)
+            return
+        if contract.after_goal_id is not None:
+            predecessor = self._goals.get(contract.after_goal_id)
+            if predecessor is not None:
+                pred_state = predecessor.goal.state
+                if pred_state in ("accepted", "executing", "finishing"):
+                    return
+                if pred_state != "succeeded":
+                    self._end_goal(
+                        record,
+                        _Ending(
+                            "cancelled",
+                            "predecessor_failed",
+                            f"predecessor goal {contract.after_goal_id} ended {pred_state}",
+                            {
+                                "predecessor_goal_id": contract.after_goal_id,
+                                "predecessor_state": pred_state,
+                                "predecessor_reason": self._goal_reason(predecessor.goal, predecessor),
+                            },
+                        ),
+                        now,
+                    )
+                    return
+        for rid in contract.resources:
+            if self._resources[rid].status.activity not in (None, goal.goal_id):
+                return
+        if record.execution_deadline is None:
+            record.execution_deadline = self._feedback.execution_time_s + contract.max_execution_s
         try:
-            if now >= record.wall_deadline:
-                raise RobotError("start_condition_failed", "the wall deadline passed before dispatch")
             if self._feedback.execution_time_s >= record.execution_deadline:
                 raise RobotError("start_condition_failed", "the execution deadline passed before dispatch")
             for rid in contract.resources:
@@ -1025,6 +1215,8 @@ class Runtime:
             ending = _Ending("failed", "precondition_changed", error.message, {"code": error.code, **error.details})
             self._end_goal(record, ending, now)
             return
+        for rid in contract.resources:
+            self._resources[rid].status.activity = goal.goal_id
 
         write = record.dispatch_write
         if write is None:
@@ -1167,12 +1359,13 @@ class Runtime:
                         observation_id=self._issue(now).observation_id,
                     )
 
-    def _end_goal(self, record: _GoalRecord, ending: _Ending, now: float) -> None:
+    def _end_goal(self, record: _GoalRecord, ending: _Ending, now: float, *, cascade: bool = True) -> None:
         goal = record.goal
         if goal.state == "accepted":
             # Never dispatched: nothing moved, so there is nothing to stop.
             for rid in goal.contract.resources:
-                self._resources[rid].status.activity = None
+                if self._resources[rid].status.activity == goal.goal_id:
+                    self._resources[rid].status.activity = None
             self._finish_goal(
                 record, ending.state, ending.reason, now, detail=ending.detail, measurements=ending.measurements
             )
@@ -1181,7 +1374,36 @@ class Runtime:
             goal.state = "stopping"
             self._begin_stop(goal.contract.resources, now)
             self._history.emit("goal.stopping", now, goal_id=goal.goal_id, reason=ending.reason)
-        # Already stopping: the first cause stands.
+        else:
+            return
+        if cascade and ending.state != "succeeded":
+            self._cancel_dependents(goal.goal_id, ending.state, ending.reason, now)
+
+    def _cancel_dependents(self, failed_id: str, state: str, reason: str, now: float) -> None:
+        """Cancel every accepted goal whose causal chain depends on a goal that did not succeed."""
+        failed: dict[str, tuple[str, str]] = {failed_id: (state, reason)}
+        for record in self._goals.values():
+            goal = record.goal
+            parent_id = goal.contract.after_goal_id
+            if goal.state != "accepted" or parent_id not in failed:
+                continue
+            parent_state, parent_reason = failed[parent_id]
+            for rid in goal.contract.resources:
+                if self._resources[rid].status.activity == goal.goal_id:
+                    self._resources[rid].status.activity = None
+            self._finish_goal(
+                record,
+                "cancelled",
+                "predecessor_failed",
+                now,
+                detail=f"predecessor goal {parent_id} ended {parent_state} ({parent_reason})",
+                measurements={
+                    "predecessor_goal_id": parent_id,
+                    "predecessor_state": parent_state,
+                    "predecessor_reason": parent_reason,
+                },
+            )
+            failed[goal.goal_id] = ("cancelled", "predecessor_failed")
 
     def _finish_goal(
         self,
@@ -1527,7 +1749,7 @@ class Runtime:
             self._begin_stop(list(self._resources), now)
             for record in self._goals.values():
                 if record.goal.state not in TERMINAL_GOAL_STATES:
-                    self._end_goal(record, _Ending("cancelled", "stopped"), now)
+                    self._end_goal(record, _Ending("cancelled", "stopped"), now, cascade=False)
             for stream in self._streams.values():
                 if stream.stream.state == "open":
                     self._end_stream(stream, "interrupted", now, "stopped")
@@ -1556,19 +1778,23 @@ class Runtime:
                 target=binding.target,
             )
 
-    def _check_free(self, resources: Sequence[str]) -> None:
-        """One goal or stream per resource group, and no queue of future motion."""
+    def _check_free(self, resources: Sequence[str], *, after: Goal | None = None) -> None:
+        """One active goal or stream per resource group, or an explicit causal chain after an unfinished goal."""
         if self._transition_in_progress is not None:
             operation = self._transition_in_progress.operation
             raise RobotError("resource_busy", f"{operation.kind} is still running", operation_id=operation.operation_id)
+        ancestors = {goal.goal_id for goal in self._ancestor_chain(after)}
         for rid in resources:
             status = self._resources[rid].status
-            if status.condition == "stopping" or status.activity is not None:
+            if status.condition == "stopping" or (status.activity is not None and status.activity not in ancestors):
                 what = "stopping" if status.condition == "stopping" else f"in use by {status.activity}"
                 raise RobotError("resource_busy", f"resource {rid!r} is {what}", resource=rid, activity=status.activity)
         for other in self._resources.values():
             busy = other.status
-            if busy.id in resources or (busy.activity is None and busy.condition != "stopping"):
+            if busy.id in resources:
+                continue
+            busy_now = busy.condition == "stopping" or (busy.activity is not None and busy.activity not in ancestors)
+            if not busy_now:
                 continue
             for rid in resources:
                 if not any(rid in group and busy.id in group for group in self._facts.concurrent):
@@ -1578,6 +1804,27 @@ class Runtime:
                         resource=rid,
                         active=busy.id,
                     )
+        for record in self._goals.values():
+            other_goal = record.goal
+            if other_goal.state in TERMINAL_GOAL_STATES or other_goal.goal_id in ancestors:
+                continue
+            for rid in resources:
+                if rid in other_goal.contract.resources:
+                    raise RobotError(
+                        "resource_busy",
+                        f"resource {rid!r} already has queued goal {other_goal.goal_id}",
+                        resource=rid,
+                        activity=other_goal.goal_id,
+                    )
+                for other_rid in other_goal.contract.resources:
+                    if not any(rid in group and other_rid in group for group in self._facts.concurrent):
+                        raise RobotError(
+                            "resource_busy",
+                            f"{rid!r} cannot run concurrently with queued goal {other_goal.goal_id} on {other_rid!r}",
+                            resource=rid,
+                            active=other_rid,
+                            activity=other_goal.goal_id,
+                        )
 
     def _begin_stop(self, resources: Sequence[str], now: float) -> None:
         for rid in resources:

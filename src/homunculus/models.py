@@ -376,6 +376,7 @@ class ResourceStatus(Model):
     controller: str
     condition: Condition
     activity: str | None = None
+    queued: list[str] = []
     retained: Retained | None = None
     fault: str | None = None
 
@@ -404,6 +405,7 @@ class ServiceLimits(Model):
     # A video link must be opened within this time; a video that is playing goes on.
     video_link_lifetime_s: float = 600.0
     operation_retention: int = 256
+    max_queued_goals: int = 8
     journal_quota: int = 10_000
 
 
@@ -567,6 +569,7 @@ class GoalSpec(Model):
     max_execution_s: float | None = Field(default=None, gt=0)
     max_wall_s: float | None = Field(default=None, gt=0)
     start_conditions: StartConditions | None = None
+    after_goal_id: str | None = None
 
 
 class GoalSubmit(GoalSpec):
@@ -585,6 +588,7 @@ class Contract(Model):
     max_wall_s: float
     stop_deadline_wall_s: float
     start_conditions: StartConditions | None = None
+    after_goal_id: str | None = None
 
 
 class GoalResult(Model):

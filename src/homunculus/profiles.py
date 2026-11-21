@@ -797,6 +797,9 @@ class Profile[A: Model, L: Model, J: MotionJudge]:
     measure: Callable[[J, Reading], ActivityStatus]
     activate: Callable[[A, L, Reading], A] = lambda action, limits, reading: action  # bind the request to the start
     duration_s: Callable[[A], float | None] = lambda action: None  # how long the request says its motion takes
+    # Predicted sample values after this goal succeeds, for admission/validation of goals queued behind it.
+    # Dispatch always re-checks real measurements.
+    expected_end: Callable[[A, L, Reading], Mapping[str, Any] | None] = lambda action, limits, reading: None
 
 
 PROFILES: dict[str, Profile[Any, Any, Any]] = {}
@@ -826,6 +829,33 @@ def _base_pose(reading: Reading) -> Pose:
     return positions["x_m"], positions["y_m"], positions["yaw_rad"]
 
 
+def _expected_trajectory_end(
+    action: JointTrajectoryGoal, _limits: JointTrajectoryLimits, reading: Reading
+) -> dict[str, Any]:
+    last = action.points[-1]
+    positions = {**reading.values["positions"], **dict(zip(action.joints, last.positions, strict=True))}
+    velocities = {**reading.values["velocities"], **dict(zip(action.joints, last.velocities, strict=True))}
+    return {**reading.values, "positions": positions, "velocities": velocities}
+
+
+def _expected_posture_end(action: HandPostureGoal, limits: HandPostureLimits, reading: Reading) -> dict[str, Any]:
+    posture = limits.postures[action.posture]
+    return {
+        **reading.values,
+        "positions": {**reading.values["positions"], **posture},
+        "velocities": {**reading.values["velocities"], **dict.fromkeys(posture, 0.0)},
+    }
+
+
+def _expected_pose_end(action: ToolPoseGoal, _limits: ToolPoseLimits, reading: Reading) -> dict[str, Any]:
+    tool = {
+        **reading.values.get("tool", {}),
+        "position_m": list(action.position_m),
+        "orientation_xyzw": list(action.orientation_xyzw),
+    }
+    return {**reading.values, "tool": tool}
+
+
 register(
     Profile(
         name="joints.trajectory/1",
@@ -836,6 +866,7 @@ register(
             action, limits, reading.values["positions"], reading.values["velocities"]
         ),
         duration_s=lambda action: action.points[-1].time_s,
+        expected_end=_expected_trajectory_end,
         judge=lambda action, limits, reading: TrajectoryJudge(action, limits),
         measure=_measure_trajectory,
     )
@@ -846,6 +877,7 @@ register(
         action=GripperWidthGoal,
         limits=GripperWidthLimits,
         resolve=_resolve_width,
+        expected_end=lambda action, _limits, reading: {**reading.values, "width_m": action.width_m},
         judge=lambda action, limits, reading: WidthJudge(action, limits),
         measure=lambda judge, reading: judge.update(reading.values["width_m"], reading.dt_s),
     )
@@ -856,6 +888,7 @@ register(
         action=HandPostureGoal,
         limits=HandPostureLimits,
         resolve=_resolve_posture,
+        expected_end=_expected_posture_end,
         judge=lambda action, limits, reading: PostureJudge(action, limits),
         measure=lambda judge, reading: judge.update(reading.values["positions"], reading.dt_s),
     )
@@ -866,6 +899,7 @@ register(
         action=ToolPoseGoal,
         limits=ToolPoseLimits,
         resolve=_resolve_pose,
+        expected_end=_expected_pose_end,
         judge=lambda action, limits, reading: PoseJudge(
             action, limits, reading.values["tool"]["position_m"], reading.values["tool"]["orientation_xyzw"]
         ),
