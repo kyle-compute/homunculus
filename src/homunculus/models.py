@@ -11,9 +11,9 @@ runtime's ``host_monotonic`` clock, whose epoch is the ``boot_id``.
 from __future__ import annotations
 
 from collections.abc import Callable
-from typing import Annotated, Any, Literal
+from typing import Annotated, Any, Literal, Self
 
-from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, SerializeAsAny, WithJsonSchema
+from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, SerializeAsAny, WithJsonSchema, model_validator
 
 PROTOCOL = "v1"
 
@@ -319,6 +319,7 @@ class ProfileBinding(Model):
     assistance: str
     stop_deadline_wall_s: float
     limits: BindingLimits
+    replaceable: bool = False  # True when this binding accepts mid-motion replace_goal_id handoffs
     # Supported is not the same as available now; the runtime fills these in.
     available: bool = True
     unavailable_reason: str | None = None
@@ -570,6 +571,13 @@ class GoalSpec(Model):
     max_wall_s: float | None = Field(default=None, gt=0)
     start_conditions: StartConditions | None = None
     after_goal_id: str | None = None
+    replace_goal_id: str | None = None
+
+    @model_validator(mode="after")
+    def _one_relation(self) -> Self:
+        if self.after_goal_id is not None and self.replace_goal_id is not None:
+            raise ValueError("give at most one of after_goal_id or replace_goal_id")
+        return self
 
 
 class GoalSubmit(GoalSpec):
@@ -589,6 +597,7 @@ class Contract(Model):
     stop_deadline_wall_s: float
     start_conditions: StartConditions | None = None
     after_goal_id: str | None = None
+    replace_goal_id: str | None = None
 
 
 class GoalResult(Model):

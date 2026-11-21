@@ -74,7 +74,7 @@ from ..models import (
     SessionOpen,
     TrajectoryPoint,
 )
-from ..profiles import ActivityStatus, TrajectoryJudge, WidthJudge, sample_trajectory
+from ..profiles import ActivityStatus, JointReference, TrajectoryJudge, WidthJudge, sample_trajectory
 from ..runtime import (
     Backend,
     BackendFacts,
@@ -195,6 +195,8 @@ class _Group:
     still_speed: float
     settle_time_s: float
     reference: np.ndarray  # the position each joint is asked to hold or follow
+    reference_velocity: np.ndarray  # velocity feedforward of the reference
+    reference_acceleration: np.ndarray  # finite-difference acceleration of the reference
     motion: _Motion | None = None
     still_for: float = 0.0
 
@@ -344,6 +346,8 @@ class MujocoBackend(Backend):
             still_speed=still_speed,
             settle_time_s=settle_time_s,
             reference=np.zeros(len(joints)),
+            reference_velocity=np.zeros(len(joints)),
+            reference_acceleration=np.zeros(len(joints)),
         )
 
     def _reset(self) -> None:
@@ -351,6 +355,8 @@ class MujocoBackend(Backend):
         mujoco.mj_forward(self._model, self._data)
         for group in self._groups.values():
             group.reference = self._data.qpos[group.qpos].copy()
+            group.reference_velocity.fill(0.0)
+            group.reference_acceleration.fill(0.0)
             group.motion, group.still_for = None, 0.0
         self._behind = self._lag = 0.0
 
@@ -372,6 +378,7 @@ class MujocoBackend(Backend):
                 ),
                 stop_deadline_wall_s=1.0,
                 limits=self._arm_limits,
+                replaceable=True,
             )
         ]
         if self._gripper_limits is not None:
@@ -386,6 +393,7 @@ class MujocoBackend(Backend):
                     assistance="the fingers are driven together toward the requested gap at a fixed speed",
                     stop_deadline_wall_s=1.0,
                     limits=self._gripper_limits,
+                    replaceable=True,
                 )
             )
         return BackendFacts(
@@ -461,6 +469,8 @@ class MujocoBackend(Backend):
         """The fallback: drop the motion and hold where the joints are measured to be."""
         group.motion = None
         group.reference = self._data.qpos[group.qpos].copy()
+        group.reference_velocity.fill(0.0)
+        group.reference_acceleration.fill(0.0)
         group.still_for = 0.0  # standstill has to be measured again after the command
 
     def manage(self, operation: str, parameters: dict[str, Any]) -> dict[str, Any]:
@@ -573,14 +583,22 @@ class MujocoBackend(Backend):
                 feedback.activities[group.motion.activity_id] = status
                 if status.phase == "done":
                     group.motion = None  # the reference it reached stays in place as the hold
+                    group.reference_velocity.fill(0.0)
+                    group.reference_acceleration.fill(0.0)
             feedback.stopped[rid] = group.motion is None and group.still_for >= group.settle_time_s
             feedback.holding[rid] = dict(zip(names, group.reference.tolist(), strict=True))
+            feedback.references[rid] = JointReference(
+                positions=dict(zip(names, group.reference.tolist(), strict=True)),
+                velocities=dict(zip(names, group.reference_velocity.tolist(), strict=True)),
+                accelerations=dict(zip(names, group.reference_acceleration.tolist(), strict=True)),
+            )
         return feedback
 
     def _control(self, group: _Group, step: float) -> None:
         """One physics step of one group: update the reference, command the actuators, judge the motion."""
         data = self._data
         positions, velocities = data.qpos[group.qpos], data.qvel[group.dof]
+        previous_velocity = group.reference_velocity.copy()
         rates = np.zeros(len(group.reference))
         motion = group.motion
         status = motion.judge.status if motion is not None else None
@@ -602,6 +620,8 @@ class MujocoBackend(Backend):
                 reach = judge.limits.speed_m_s / fingers * step
                 group.reference += np.clip(share - group.reference, -reach, reach)
                 judge.update(float(positions.sum()), step)
+        group.reference_velocity = rates
+        group.reference_acceleration = (rates - previous_velocity) / step if step > 0 else np.zeros_like(rates)
         # Each actuator's force is gain*ctrl + bias0 + bias1*length + bias2*velocity. This ctrl turns it into a
         # spring and damper on the error from the reference length and velocity, so the damping acts on the
         # velocity error instead of on the motion itself.

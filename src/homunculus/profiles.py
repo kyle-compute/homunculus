@@ -298,24 +298,89 @@ def _resolve_trajectory(action: JointTrajectoryGoal, limits: JointTrajectoryLimi
     return action.model_copy(update=tolerances)
 
 
+def verified_joint_start(
+    joints: Sequence[str],
+    positions: Mapping[str, float],
+    velocities: Mapping[str, float],
+    *,
+    path_tolerance: float,
+    settle_velocity: float,
+    reference: JointReference | None = None,
+) -> tuple[list[float], list[float], list[float]]:
+    """Anchor a joint motion to the controller reference only after verifying it against measurements.
+
+    Refuses partial-joint handoffs that leave any moving joint uncommanded, and refuses references
+    that have diverged beyond `path_tolerance` from the real sensor reading.
+    """
+    if reference is not None:
+        commanded = set(joints)
+        for name, meas_v in velocities.items():
+            if name in commanded:
+                continue
+            ref_v = reference.velocities.get(name, 0.0)
+            if abs(meas_v) > settle_velocity or abs(ref_v) > settle_velocity:
+                raise RobotError(
+                    "start_condition_failed",
+                    f"joint {name!r} is still moving ({max(abs(meas_v), abs(ref_v)):.3f}) "
+                    "and is not commanded by this goal",
+                    joint=name,
+                    measured_velocity=meas_v,
+                    reference_velocity=ref_v,
+                    settle_velocity=settle_velocity,
+                )
+    start_q: list[float] = []
+    start_v: list[float] = []
+    start_a: list[float] = []
+    for name in joints:
+        meas_q, meas_v = positions[name], velocities[name]
+        if reference is not None and name in reference.positions:
+            ref_q = reference.positions[name]
+            err = abs(ref_q - meas_q)
+            if err > path_tolerance:
+                raise RobotError(
+                    "start_condition_failed",
+                    f"controller reference for {name!r} diverges from measured position by {err:.4f} "
+                    f"(limit {path_tolerance:g})",
+                    joint=name,
+                    reference_position=ref_q,
+                    measured_position=meas_q,
+                    path_tolerance=path_tolerance,
+                )
+            start_q.append(ref_q)
+            start_v.append(reference.velocities.get(name, meas_v))
+            start_a.append(reference.accelerations.get(name, 0.0))
+        else:
+            start_q.append(meas_q)
+            start_v.append(meas_v)
+            start_a.append(0.0)
+    return start_q, start_v, start_a
+
+
 def activate_trajectory(
     action: JointTrajectoryGoal,
     limits: JointTrajectoryLimits,
     positions: Mapping[str, float],
     velocities: Mapping[str, float],
+    *,
+    reference: JointReference | None = None,
 ) -> JointTrajectoryGoal:
-    """Bind a resolved trajectory to the measured state at activation.
+    """Bind a resolved trajectory to the measured state (or verified controller reference) at activation.
 
-    A waypoint at time zero must match the measured start. Otherwise the
-    measured state becomes the waypoint at zero and that first segment is
-    validated like any other, before any movement.
+    A waypoint at time zero must match the start state. Otherwise the start state becomes the waypoint
+    at zero and that first segment is validated like any other, before any movement.
     """
-    measured_q = [positions[name] for name in action.joints]
-    measured_v = [velocities[name] for name in action.joints]
+    start_q, start_v, _ = verified_joint_start(
+        action.joints,
+        positions,
+        velocities,
+        path_tolerance=action.path_tolerance or limits.path_tolerance,
+        settle_velocity=limits.settle_velocity,
+        reference=reference,
+    )
     first = action.points[0]
     if first.time_s == 0.0:
         for name, q, v, want_q, want_v in zip(
-            action.joints, measured_q, measured_v, first.positions, first.velocities, strict=True
+            action.joints, start_q, start_v, first.positions, first.velocities, strict=True
         ):
             if abs(q - want_q) > limits.start_position_tolerance or abs(v - want_v) > limits.start_velocity_tolerance:
                 raise RobotError(
@@ -329,7 +394,7 @@ def activate_trajectory(
                     velocity_tolerance=limits.start_velocity_tolerance,
                 )
         return action
-    start = TrajectoryPoint(time_s=0.0, positions=measured_q, velocities=measured_v)
+    start = TrajectoryPoint(time_s=0.0, positions=start_q, velocities=start_v)
     known = {joint.name: joint for joint in limits.joints}
     check_path(
         [start, first],
@@ -771,6 +836,15 @@ def _mean_velocity(poses: Sequence[tuple[float, float, float, float]], window_s:
 
 
 @dataclass(frozen=True)
+class JointReference:
+    """The controller's commanded joint state for one resource, verified against measurements before use."""
+
+    positions: Mapping[str, float]
+    velocities: Mapping[str, float]
+    accelerations: Mapping[str, float] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
 class Reading:
     """One measurement of a goal's first resource, as the runtime hands it to the goal's profile."""
 
@@ -779,6 +853,7 @@ class Reading:
     elapsed_s: float = 0.0  # since the goal was activated
     dt_s: float = 0.0  # since the previous reading
     still_for_s: float = 0.0  # how long the backend has measured the resource at rest under the fallback
+    reference: JointReference | None = None  # controller reference for smooth mid-motion handoff
 
 
 @dataclass(frozen=True)
@@ -863,7 +938,7 @@ register(
         limits=JointTrajectoryLimits,
         resolve=_resolve_trajectory,
         activate=lambda action, limits, reading: activate_trajectory(
-            action, limits, reading.values["positions"], reading.values["velocities"]
+            action, limits, reading.values["positions"], reading.values["velocities"], reference=reading.reference
         ),
         duration_s=lambda action: action.points[-1].time_s,
         expected_end=_expected_trajectory_end,

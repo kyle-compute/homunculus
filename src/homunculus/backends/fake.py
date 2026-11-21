@@ -39,6 +39,7 @@ from ..models import (
 )
 from ..profiles import (
     ActivityStatus,
+    JointReference,
     PostureJudge,
     TrajectoryJudge,
     VelocityJudge,
@@ -77,6 +78,7 @@ class _Group:
     settle_time_s: float
     still_for: float = 0.0
     motion: _Motion | None = None
+    reference: JointReference | None = None
     sample: Sample | None = None
 
 
@@ -156,6 +158,7 @@ def _g1() -> _Robot:
                 assistance="none: joints move to the named posture at a fixed speed",
                 stop_deadline_wall_s=0.5,
                 limits=hand,
+                replaceable=True,
             ),
         ],
         groups=[
@@ -243,6 +246,7 @@ def _arm() -> _Robot:
                 assistance="none: joints replay the validated trajectory",
                 stop_deadline_wall_s=0.5,
                 limits=arm,
+                replaceable=True,
             ),
             ProfileBinding(
                 profile="gripper.width/1",
@@ -254,6 +258,7 @@ def _arm() -> _Robot:
                 assistance="none: the jaw moves at a fixed speed",
                 stop_deadline_wall_s=0.5,
                 limits=gripper,
+                replaceable=True,
             ),
         ],
         groups=[
@@ -352,6 +357,7 @@ class FakeBackend(Backend):
 
     def _halt(self, group: _Group) -> None:
         group.motion = None
+        group.reference = None
         group.velocities = dict.fromkeys(group.velocities, 0.0)
         if group.spec.joints:
             group.hold = dict(group.positions)
@@ -389,6 +395,7 @@ class FakeBackend(Backend):
                     group.velocities = dict.fromkeys(group.velocities, 0.0)
                 elif status.phase == "done":
                     group.motion = None
+                    group.reference = None
                     group.hold.update(_reached(motion.judge))
                 feedback.activities[motion.activity_id] = status
 
@@ -412,6 +419,8 @@ class FakeBackend(Backend):
             feedback.samples[rid] = group.sample.model_copy(update={"valid": False}) if lost else group.sample
             feedback.stopped[rid] = not lost and group.motion is None and group.still_for >= group.settle_time_s
             feedback.holding[rid] = dict(group.hold)
+            if group.reference is not None:
+                feedback.references[rid] = group.reference
         return feedback
 
     def _judge(self, group: _Group, motion: _Motion, dt: float) -> ActivityStatus:
@@ -446,11 +455,19 @@ def _reached(judge: _Judge) -> dict[str, float]:
 def _move(group: _Group, judge: _Judge, elapsed: float, dt: float, blocked: bool) -> None:
     """The fake's controllers: joints follow their command exactly, unless blocked. Nothing is simulated."""
     if isinstance(judge, TrajectoryJudge):
+        prev_v = group.reference.velocities if group.reference is not None else dict.fromkeys(group.positions, 0.0)
         reference, rates = sample_trajectory(judge.action.points, elapsed)
+        ref_positions = dict(group.positions)
+        ref_velocities = dict.fromkeys(group.positions, 0.0)
+        ref_accelerations = dict.fromkeys(group.positions, 0.0)
         for name, position, rate in zip(judge.action.joints, reference, rates, strict=True):
+            ref_positions[name] = position
+            ref_velocities[name] = rate
+            ref_accelerations[name] = (rate - prev_v.get(name, 0.0)) / dt if dt > 0 else 0.0
             if not blocked:
                 group.positions[name] = position
             group.velocities[name] = 0.0 if blocked else rate
+        group.reference = JointReference(ref_positions, ref_velocities, ref_accelerations)
     elif isinstance(judge, VelocityJudge):  # a timed goal, or a stream's setpoint
         command, duration = judge.command, judge.duration_s
         timed = duration is not None

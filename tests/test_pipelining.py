@@ -5,11 +5,14 @@ from __future__ import annotations
 import itertools
 import math
 from collections.abc import Callable, Iterator
+from concurrent.futures import Future
 from contextlib import ExitStack
 from pathlib import Path
 
 import pytest
+from pydantic import ValidationError
 
+from homunculus import rigs
 from homunculus.backends.fake import FakeBackend
 from homunculus.journal import Journal
 from homunculus.models import (
@@ -27,6 +30,7 @@ from homunculus.models import (
     TrajectoryPoint,
     ValidateRequest,
 )
+from homunculus.profiles import JointReference
 from homunculus.runtime import Backend, Clock, Principal, Runtime
 
 CLIENT = Principal("client")
@@ -140,6 +144,19 @@ def arm(tmp_path: Path) -> Iterator[Harness]:
 @pytest.fixture
 def g1(tmp_path: Path) -> Iterator[Harness]:
     with Harness(tmp_path / "g1.sqlite", "g1") as harness:
+        harness.open()
+        yield harness
+
+
+@pytest.fixture
+def panda(tmp_path: Path) -> Iterator[Harness]:
+    mujoco_backend = pytest.importorskip("homunculus.backends.mujoco")
+    folder = rigs.find("panda")
+    with Harness(
+        tmp_path / "panda.sqlite",
+        "panda",
+        make_backend=lambda clock: mujoco_backend.MujocoBackend(clock, folder),
+    ) as harness:
         harness.open()
         yield harness
 
@@ -446,3 +463,265 @@ def test_cross_session_and_unknown_predecessor_refused(arm: Harness):
     with pytest.raises(RobotError) as cross_session:
         arm.submit(move_joint1(0.8, at=1.0), after_goal_id=g1.goal_id, principal=OTHER, session_id=other_session)
     assert cross_session.value.code == "permission_denied"
+
+
+# --------------------------------------------------------------------------
+# Smooth replacement (replace_goal_id)
+# --------------------------------------------------------------------------
+
+
+def test_goal_spec_forbids_both_after_and_replace():
+    with pytest.raises(ValidationError, match="at most one"):
+        GoalSpec(action=move_joint1(0.4), after_goal_id="goal-a", replace_goal_id="goal-b")
+
+
+def test_replace_queued_goal_swaps_atomically_and_drops_tail(tmp_path: Path):
+    with Harness(tmp_path / "arm.sqlite", "arm", limits=ServiceLimits(max_queued_goals=2)) as arm:
+        arm.open()
+        g1 = arm.submit(move_joint1(0.4, at=1.0))
+        arm.run(0.1)
+        g2 = arm.submit(move_joint1(0.8, at=1.0), after_goal_id=g1.goal_id)
+        g3 = arm.submit(move_joint1(0.2, at=1.0), after_goal_id=g2.goal_id)
+
+        # Queue is full (2/2), yet replacing queued g2 works cleanly, inherits after=g1, and cancels g3.
+        g2_new = arm.submit(move_joint1(-0.3, at=1.2), replace_goal_id=g2.goal_id)
+        assert g2_new.state == "accepted"
+        assert g2_new.contract.after_goal_id == g1.goal_id
+        assert g2_new.contract.replace_goal_id == g2.goal_id
+
+        old_g2 = arm.runtime.goal(g2.goal_id)
+        assert old_g2.state == "cancelled"
+        assert old_g2.result.reason == "superseded"
+        assert old_g2.result.measurements["superseded_by"] == g2_new.goal_id
+
+        old_g3 = arm.runtime.goal(g3.goal_id)
+        assert old_g3.state == "cancelled"
+        assert old_g3.result.reason == "predecessor_failed"
+
+        # g1 kept executing undisturbed and hands off straight to g2_new.
+        assert arm.runtime.goal(g1.goal_id).state == "executing"
+        assert arm.resource("arm").queued == [g2_new.goal_id]
+        arm.run(3.5)
+        assert arm.runtime.goal(g1.goal_id).state == "succeeded"
+        assert arm.runtime.goal(g2_new.goal_id).state == "succeeded"
+        assert [e[1] for e in arm.backend.effects if e[0] == "apply"] == [g1.goal_id, g2_new.goal_id]
+        obs = arm.runtime.observe()
+        assert math.isclose(obs.samples["arm"].values["positions"]["joint1"], -0.3, abs_tol=0.01)
+
+
+def test_replace_queued_works_on_non_replaceable_binding_while_active_refuses(g1: Harness):
+    hand = g1.submit(HandPostureGoal(profile="hand.posture/1", target="left_hand", posture="pinch"))
+    g1.run(0.1)
+    drive1 = g1.submit(
+        BaseVelocityGoal(
+            profile="base.planar_velocity/1",
+            target="base",
+            forward_m_s=0.2,
+            left_m_s=0.0,
+            yaw_rate_rad_s=0.0,
+            duration_s=0.8,
+        ),
+        after_goal_id=hand.goal_id,
+    )
+    # Replacing queued drive1 works even though base.planar_velocity/1 has replaceable=False.
+    drive2 = g1.submit(
+        BaseVelocityGoal(
+            profile="base.planar_velocity/1",
+            target="base",
+            forward_m_s=0.3,
+            left_m_s=0.0,
+            yaw_rate_rad_s=0.0,
+            duration_s=0.8,
+        ),
+        replace_goal_id=drive1.goal_id,
+    )
+    assert g1.runtime.goal(drive1.goal_id).result.reason == "superseded"
+    # Once drive2 starts executing, active mid-motion replacement is refused with unsupported_mode.
+    while g1.runtime.goal(drive2.goal_id).state != "executing":
+        g1.run(STEP)
+    with pytest.raises(RobotError) as unsupported:
+        g1.submit(
+            BaseVelocityGoal(
+                profile="base.planar_velocity/1",
+                target="base",
+                forward_m_s=0.4,
+                left_m_s=0.0,
+                yaw_rate_rad_s=0.0,
+                duration_s=0.8,
+            ),
+            replace_goal_id=drive2.goal_id,
+        )
+    assert unsupported.value.code == "unsupported_mode"
+
+
+def test_active_mid_motion_replace_hands_off_smoothly_without_stop(arm: Harness):
+    g1 = arm.submit(move_joint1(1.0, at=1.5))
+    arm.run(0.1)
+    queued_tail = arm.submit(
+        GripperWidthGoal(profile="gripper.width/1", target="gripper", width_m=0.02), after_goal_id=g1.goal_id
+    )
+    arm.run(0.5)  # g1 is moving fast (~1.0 rad/s)
+    mid_obs = arm.runtime.observe()
+    speed_before = mid_obs.samples["arm"].values["velocities"]["joint1"]
+    assert speed_before > 0.5
+
+    # Validate & submit mid-motion redirect AND queue a gripper close right behind it in the same turn.
+    redirect_action = move_joint1(-0.4, at=1.5)
+    check = arm.runtime.validate(ValidateRequest(goal=GoalSpec(action=redirect_action, replace_goal_id=g1.goal_id)))
+    assert check.valid is True
+    g2 = arm.submit(redirect_action, replace_goal_id=g1.goal_id)
+    g3 = arm.submit(
+        GripperWidthGoal(profile="gripper.width/1", target="gripper", width_m=0.02), after_goal_id=g2.goal_id
+    )
+
+    # During g2's dispatch write tick, g1 keeps moving; on the handoff tick g1 ends superseded with 0 stops!
+    arm.run(3.0)
+    done1 = arm.runtime.goal(g1.goal_id)
+    assert done1.state == "cancelled"
+    assert done1.result.reason == "superseded"
+    assert done1.result.stop_confirmed is None
+    assert done1.result.measurements["superseded_by"] == g2.goal_id
+
+    done_tail = arm.runtime.goal(queued_tail.goal_id)
+    assert done_tail.state == "cancelled"
+    assert done_tail.result.reason == "predecessor_failed"
+
+    done2 = arm.runtime.goal(g2.goal_id)
+    assert done2.state == "succeeded"
+    # g2 anchored to g1's nonzero velocity at handoff!
+    assert done2.contract.action.points[0].velocities[0] > 0.5
+    assert arm.runtime.goal(g3.goal_id).state == "succeeded"
+
+    # Zero stop commands were ever sent to the backend.
+    assert [e for e in arm.backend.effects if e[0] == "stop"] == []
+    assert [e[1] for e in arm.backend.effects if e[0] == "apply"] == [g1.goal_id, g2.goal_id, g3.goal_id]
+    final = arm.runtime.observe()
+    assert math.isclose(final.samples["arm"].values["positions"]["joint1"], -0.4, abs_tol=0.01)
+
+
+def test_active_replace_guards_partial_joints_diverged_reference_and_resource_mismatch(arm: Harness):
+    both = JointTrajectoryGoal(
+        profile="joints.trajectory/1",
+        target="arm",
+        joints=["joint1", "joint2"],
+        points=[TrajectoryPoint(time_s=1.5, positions=[0.8, 0.6], velocities=[0.0, 0.0])],
+    )
+    g1 = arm.submit(both)
+    arm.run(0.5)  # both joint1 and joint2 moving well above settle_velocity
+
+    # Mismatched resources refused.
+    with pytest.raises(RobotError) as mismatch:
+        arm.submit(
+            GripperWidthGoal(profile="gripper.width/1", target="gripper", width_m=0.02), replace_goal_id=g1.goal_id
+        )
+    assert mismatch.value.code == "invalid_request"
+
+    # Partial-joint replacement omitting still-moving joint2 is refused; g1 keeps running!
+    with pytest.raises(RobotError) as partial:
+        arm.submit(move_joint1(-0.2, at=1.5), replace_goal_id=g1.goal_id)
+    assert partial.value.code == "start_condition_failed"
+    assert partial.value.details["joint"] == "joint2"
+
+    # Diverged controller reference (> path_tolerance from real measurement) is refused by the core trust check!
+    real_ref = arm.runtime._feedback.references["arm"]
+    arm.runtime._feedback.references["arm"] = JointReference(
+        positions={**real_ref.positions, "joint1": real_ref.positions["joint1"] + 0.5},
+        velocities=real_ref.velocities,
+    )
+    with pytest.raises(RobotError) as diverged:
+        arm.submit(
+            JointTrajectoryGoal(
+                profile="joints.trajectory/1",
+                target="arm",
+                joints=["joint1", "joint2"],
+                points=[TrajectoryPoint(time_s=1.5, positions=[0.2, 0.2], velocities=[0.0, 0.0])],
+            ),
+            replace_goal_id=g1.goal_id,
+        )
+    assert diverged.value.code == "start_condition_failed"
+    assert diverged.value.details["joint"] == "joint1"
+
+    # g1 was never disturbed by any rejected replacement and finishes cleanly.
+    arm.run(2.0)
+    assert arm.runtime.goal(g1.goal_id).state == "succeeded"
+
+
+def test_active_replace_dispatch_failure_leaves_old_goal_running(arm: Harness, monkeypatch: pytest.MonkeyPatch):
+    g1 = arm.submit(move_joint1(0.8, at=1.5))
+    arm.run(0.4)
+    g2 = arm.submit(move_joint1(-0.2, at=1.5), replace_goal_id=g1.goal_id)
+
+    # Inject a failed dispatch journal write for g2: g2 fails journal_error, g1 finishes unharmed!
+    failed_write: Future[None] = Future()
+    failed_write.set_exception(OSError("disk full"))
+    monkeypatch.setattr(arm.journal, "record_later", lambda *args, **kwargs: failed_write)
+    arm.run(STEP)  # triggers dispatch_write
+    arm.run(STEP)  # sees failed_write.exception()
+    monkeypatch.undo()
+
+    done2 = arm.runtime.goal(g2.goal_id)
+    assert done2.state == "failed"
+    assert done2.result.reason == "journal_error"
+    assert arm.runtime.goal(g1.goal_id).state == "executing"
+    arm.run(2.0)
+    assert arm.runtime.goal(g1.goal_id).state == "succeeded"
+
+
+def test_active_replace_backend_apply_error_triggers_safety_stop(arm: Harness, monkeypatch: pytest.MonkeyPatch):
+    g1 = arm.submit(move_joint1(0.8, at=1.5))
+    arm.run(0.4)
+    g2 = arm.submit(move_joint1(-0.2, at=1.5), replace_goal_id=g1.goal_id)
+    arm.run(STEP)  # dispatch_write queued & flushed
+
+    def boom(activity_id: str, contract) -> None:
+        raise RuntimeError("can bus offline")
+
+    monkeypatch.setattr(arm.backend, "apply", boom)
+    arm.run(STEP)  # handoff fires backend.apply -> raises -> safety stop dispatched!
+    monkeypatch.undo()
+    arm.run(0.5)
+
+    assert arm.runtime.goal(g1.goal_id).state == "cancelled"
+    assert arm.runtime.goal(g1.goal_id).result.reason == "superseded"
+    done2 = arm.runtime.goal(g2.goal_id)
+    assert done2.state == "failed"
+    assert done2.result.reason == "backend_error"
+    assert any(effect[0] == "stop" and "arm" in effect[1] for effect in arm.backend.effects)
+
+
+def test_active_replace_when_target_succeeds_during_dispatch_activates_from_held(arm: Harness):
+    g1 = arm.submit(move_joint1(0.4, at=0.8))
+    arm.run(0.95)  # g1 is near end of settling
+    g2 = arm.submit(move_joint1(0.7, at=0.8), replace_goal_id=g1.goal_id)
+    arm.run(2.0)
+    # Regardless of whether g1 succeeded or was superseded on that boundary tick, g2 reaches 0.7 cleanly.
+    assert arm.runtime.goal(g1.goal_id).state in ("succeeded", "cancelled")
+    assert arm.runtime.goal(g2.goal_id).state == "succeeded"
+    obs = arm.runtime.observe()
+    assert math.isclose(obs.samples["arm"].values["positions"]["joint1"], 0.7, abs_tol=0.01)
+
+
+def test_mujoco_panda_active_mid_motion_replace_is_continuous(panda: Harness):
+    g1 = panda.submit(move_joint1(0.8, at=1.6))
+    panda.run(0.6)
+    obs_before = panda.runtime.observe()
+    v_before = obs_before.samples["arm"].values["velocities"]["joint1"]
+    assert v_before > 0.3
+
+    g2 = panda.submit(move_joint1(-0.4, at=1.8), replace_goal_id=g1.goal_id)
+    # Step until handoff happens and verify velocity stays continuous right across the handoff tick.
+    while panda.runtime.goal(g2.goal_id).state == "accepted":
+        panda.run(STEP)
+    done1 = panda.runtime.goal(g1.goal_id)
+    assert done1.state == "cancelled"
+    assert done1.result.reason == "superseded"
+    assert done1.result.stop_confirmed is None
+
+    # Bound start velocity of g2 must match the live reference velocity (no zero-velocity drop!).
+    active2 = panda.runtime.goal(g2.goal_id)
+    assert active2.contract.action.points[0].velocities[0] > 0.3
+
+    panda.run(2.5)
+    assert panda.runtime.goal(g2.goal_id).state == "succeeded"
+    final = panda.runtime.observe()
+    assert math.isclose(final.samples["arm"].values["positions"]["joint1"], -0.4, abs_tol=0.02)
