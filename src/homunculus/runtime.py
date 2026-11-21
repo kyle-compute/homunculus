@@ -452,6 +452,12 @@ class Runtime:
             except Exception:  # the other robots of the service are still to be stopped
                 log.exception("backend stop failed during shutdown")
 
+    def __enter__(self) -> Self:
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self.close()
+
     def _read_backend(self) -> Feedback:
         try:
             return self._backend.advance()
@@ -993,17 +999,14 @@ class Runtime:
                             for rid in contract.resources
                         )
                     else:
+                        ending = self._predecessor_failed("target", t_goal, t_record)
                         self._finish_goal(
                             record,
-                            "cancelled",
-                            "predecessor_failed",
+                            ending.state,
+                            ending.reason,
                             now,
-                            detail=f"target goal {request.replace_goal_id} ended {t_goal.state}",
-                            measurements={
-                                "predecessor_goal_id": request.replace_goal_id,
-                                "predecessor_state": t_goal.state,
-                                "predecessor_reason": self._goal_reason(t_goal, t_record),
-                            },
+                            detail=ending.detail,
+                            measurements=ending.measurements,
                         )
                         return goal.model_copy(deep=True)
                 if contract.after_goal_id is not None:
@@ -1011,18 +1014,14 @@ class Runtime:
                     if found is not None:
                         pred_goal, pred_record = found
                         if pred_goal.state in ("stopping", "failed", "cancelled", "interrupted"):
-                            pred_reason = self._goal_reason(pred_goal, pred_record)
+                            ending = self._predecessor_failed("predecessor", pred_goal, pred_record)
                             self._finish_goal(
                                 record,
-                                "cancelled",
-                                "predecessor_failed",
+                                ending.state,
+                                ending.reason,
                                 now,
-                                detail=f"predecessor goal {contract.after_goal_id} ended {pred_goal.state}",
-                                measurements={
-                                    "predecessor_goal_id": contract.after_goal_id,
-                                    "predecessor_state": pred_goal.state,
-                                    "predecessor_reason": pred_reason,
-                                },
+                                detail=ending.detail,
+                                measurements=ending.measurements,
                             )
                             return goal.model_copy(deep=True)
                         if pred_goal.state == "succeeded":
@@ -1129,6 +1128,19 @@ class Runtime:
         if record is not None and record.ending is not None:
             return record.ending.reason
         return goal.result.reason if goal.result is not None else None
+
+    @classmethod
+    def _predecessor_failed(cls, noun: str, goal: Goal, record: _GoalRecord | None = None) -> _Ending:
+        return _Ending(
+            "cancelled",
+            "predecessor_failed",
+            f"{noun} goal {goal.goal_id} ended {goal.state}",
+            {
+                "predecessor_goal_id": goal.goal_id,
+                "predecessor_state": goal.state,
+                "predecessor_reason": cls._goal_reason(goal, record),
+            },
+        )
 
     def _ancestor_chain(self, after: Goal | None, *, follow_replace: bool = False) -> list[Goal]:
         """Unfinished ancestors starting at `after`, following `after_goal_id` (and optionally `replace_goal_id`)."""
@@ -1365,20 +1377,7 @@ class Runtime:
                 if pred_state in ("accepted", "executing", "finishing"):
                     return
                 if pred_state != "succeeded":
-                    self._end_goal(
-                        record,
-                        _Ending(
-                            "cancelled",
-                            "predecessor_failed",
-                            f"predecessor goal {contract.after_goal_id} ended {pred_state}",
-                            {
-                                "predecessor_goal_id": contract.after_goal_id,
-                                "predecessor_state": pred_state,
-                                "predecessor_reason": self._goal_reason(predecessor.goal, predecessor),
-                            },
-                        ),
-                        now,
-                    )
+                    self._end_goal(record, self._predecessor_failed("predecessor", predecessor.goal, predecessor), now)
                     return
         elif contract.replace_goal_id is not None:
             found = self._find_goal(contract.replace_goal_id)
@@ -1390,26 +1389,12 @@ class Runtime:
                     and target_goal.result.reason == "superseded"
                     and target_goal.result.measurements.get("superseded_by") == goal.goal_id
                 )
-                if already_superseded or target_goal.state == "succeeded":
-                    pass
-                elif target_goal.state in ("executing", "finishing") and target_rec is not None:
-                    replacing = target_rec
-                else:
-                    self._end_goal(
-                        record,
-                        _Ending(
-                            "cancelled",
-                            "predecessor_failed",
-                            f"target goal {contract.replace_goal_id} ended {target_goal.state}",
-                            {
-                                "predecessor_goal_id": contract.replace_goal_id,
-                                "predecessor_state": target_goal.state,
-                                "predecessor_reason": self._goal_reason(target_goal, target_rec),
-                            },
-                        ),
-                        now,
-                    )
-                    return
+                if not (already_superseded or target_goal.state == "succeeded"):
+                    if target_goal.state in ("executing", "finishing") and target_rec is not None:
+                        replacing = target_rec
+                    else:
+                        self._end_goal(record, self._predecessor_failed("target", target_goal, target_rec), now)
+                        return
 
         if replacing is None:
             for rid in contract.resources:

@@ -178,20 +178,42 @@ def solve_smooth(
     slack = limits.start_position_tolerance
     eps = 1e-9
 
-    def build_if_feasible(duration: float) -> tuple[_Quintic, ...] | None:
-        curves: list[_Quintic] = []
-        for j, q0, v0, a0, q1 in zip(joint_limits, start_q, start_v, start_a, targets, strict=True):
-            poly = _Quintic.fit(q0, v0, a0, q1, duration)
-            low, high, speed, acc = _quintic_extrema(poly, duration)
-            if (
-                low < j.min_position - slack - eps
-                or high > j.max_position + slack + eps
-                or speed > j.max_velocity * action.speed_scale + eps
-                or acc > j.max_acceleration + eps
-            ):
+    def search(a_scale: float) -> tuple[float, tuple[_Quintic, ...]] | None:
+        def build_if_feasible(duration: float) -> tuple[_Quintic, ...] | None:
+            curves: list[_Quintic] = []
+            for j, q0, v0, a0, q1 in zip(joint_limits, start_q, start_v, start_a, targets, strict=True):
+                poly = _Quintic.fit(q0, v0, a0 * a_scale, q1, duration)
+                low, high, speed, acc = _quintic_extrema(poly, duration)
+                if (
+                    low < j.min_position - slack - eps
+                    or high > j.max_position + slack + eps
+                    or speed > j.max_velocity * action.speed_scale + eps
+                    or acc > j.max_acceleration + eps
+                ):
+                    return None
+                curves.append(poly)
+            return tuple(curves)
+
+        # Scan geometrically first: heading toward a limit at nonzero speed makes feasibility a window [t_lo, t_hi].
+        bad = lower
+        candidate = lower
+        while True:
+            curves = build_if_feasible(candidate)
+            if curves is not None:
+                lo, hi = bad, candidate
+                if hi > lower:
+                    for _ in range(20):
+                        mid = 0.5 * (lo + hi)
+                        mid_curves = build_if_feasible(mid)
+                        if mid_curves is not None:
+                            hi, curves = mid, mid_curves
+                        else:
+                            lo = mid
+                return hi, curves
+            bad = candidate
+            if candidate >= limits.max_duration_s:
                 return None
-            curves.append(poly)
-        return tuple(curves)
+            candidate = min(limits.max_duration_s, candidate * 1.15)
 
     lower = max(
         action.min_duration_s or 0.0,
@@ -211,40 +233,18 @@ def solve_smooth(
             maximum=limits.max_duration_s,
         )
 
-    # Scan geometrically first: heading toward a limit at nonzero speed makes feasibility a window [t_lo, t_hi].
-    bad = lower
-    good: float | None = None
-    best_curves: tuple[_Quintic, ...] | None = None
-    candidate = lower
-    while True:
-        curves = build_if_feasible(candidate)
-        if curves is not None:
-            good, best_curves = candidate, curves
-            break
-        bad = candidate
-        if candidate >= limits.max_duration_s:
-            break
-        candidate = min(limits.max_duration_s, candidate * 1.15)
-
-    if good is None or best_curves is None:
+    # Prefer full C2 continuity; if initial acceleration pushes a single quintic past v_max, relax a0 to 0 (C1).
+    solved = search(1.0)
+    if solved is None and any(start_a):
+        solved = search(0.0)
+    if solved is None:
         raise RobotError(
             "limit_exceeded",
-            f"no feasible C2 smooth motion within max_duration_s={limits.max_duration_s:g} respects joint limits",
+            f"no feasible smooth motion within max_duration_s={limits.max_duration_s:g} respects joint limits",
             parameter="max_duration_s",
             maximum=limits.max_duration_s,
         )
-
-    if good > lower:
-        lo, hi = bad, good
-        for _ in range(20):
-            mid = 0.5 * (lo + hi)
-            curves = build_if_feasible(mid)
-            if curves is not None:
-                hi, best_curves = mid, curves
-            else:
-                lo = mid
-        good = hi
-
+    good, best_curves = solved
     return SmoothPlan(joints=joints, duration_s=good, curves=best_curves)
 
 
@@ -274,18 +274,18 @@ class SmoothJudge(MotionJudge):
         action, limits = self.action, self.limits
         reference, _ = self.plan.sample(elapsed)
         errors = [abs(q - r) for q, r in zip(positions, reference, strict=True)]
-        worst = max(range(len(errors)), key=errors.__getitem__)
-        self.peak_error = max(self.peak_error, errors[worst])
-        if errors[worst] > action.path_tolerance:
+        worst, worst_error = max(enumerate(errors), key=lambda item: item[1])
+        self.peak_error = max(self.peak_error, worst_error)
+        if worst_error > action.path_tolerance:
             measurements = {
                 "joint": self.plan.joints[worst],
-                "tracking_error": errors[worst],
+                "tracking_error": worst_error,
                 "path_tolerance": action.path_tolerance,
                 "measured": positions[worst],
                 "reference": reference[worst],
             }
             detail = (
-                f"{self.plan.joints[worst]} trailed the reference by {errors[worst]:.4f}; "
+                f"{self.plan.joints[worst]} trailed the reference by {worst_error:.4f}; "
                 f"the limit is {action.path_tolerance:g}"
             )
             return ActivityStatus("failed", measurements, error="path_tolerance_violated", detail=detail)
