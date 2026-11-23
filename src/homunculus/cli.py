@@ -266,6 +266,8 @@ def _description_text(d: RobotDescription) -> str:
     rows = []
     for resource in d.resources:
         using = f"used by {resource.activity}" if resource.activity else "idle"
+        if resource.queued:
+            using += f" (queued: {', '.join(resource.queued)})"
         held = (
             f"holds {resource.retained.kind} {_flat(resource.retained.target)}"
             if resource.retained
@@ -344,6 +346,10 @@ def _goal_text(goal: Goal) -> str:
     reason = f" ({goal.result.reason})" if goal.result and goal.result.reason != goal.state else ""
     rows = [("profile", f"{action.profile} on {action.target!r}; resources {', '.join(goal.contract.resources)}")]
     rows.append(("deadlines", f"{goal.contract.max_execution_s:g} s execution, {goal.contract.max_wall_s:g} s wall"))
+    if goal.contract.after_goal_id:
+        rows.append(("after", goal.contract.after_goal_id))
+    if goal.contract.replace_goal_id:
+        rows.append(("replaces", goal.contract.replace_goal_id))
     if goal.result:
         if goal.result.detail:
             rows.append(("detail", goal.result.detail))
@@ -527,6 +533,10 @@ def _submit(args: argparse.Namespace, client: RobotClient, action: Action, **set
     """Shared tail of every goal command: check only, or submit and optionally wait for the outcome."""
     settings.setdefault("max_execution_s", args.max_execution)
     settings.setdefault("max_wall_s", args.max_wall)
+    settings.setdefault("after_goal_id", args.after_goal_id)
+    settings.setdefault("replace_goal_id", args.replace_goal_id)
+    if settings.get("after_goal_id") is not None and settings.get("replace_goal_id") is not None:
+        raise UsageError("give at most one of --after / after_goal_id or --replace / replace_goal_id")
     if args.dry_run:
         # The goal as it would be submitted, deadlines and start conditions included. A session is not needed.
         proposed = {name: settings[name] for name in GoalSpec.model_fields if name in settings}
@@ -549,6 +559,8 @@ def goal_submit(args: argparse.Namespace) -> int:
         ("request_id", "--request-id", args.request_id),
         ("max_execution_s", "--max-execution", args.max_execution),
         ("max_wall_s", "--max-wall", args.max_wall),
+        ("after_goal_id", "--after", args.after_goal_id),
+        ("replace_goal_id", "--replace", args.replace_goal_id),
     ):
         if field in request and given is not None:
             raise UsageError(f"{source} holds {field} and {flag} was given as well; give it once")
@@ -1426,6 +1438,21 @@ def _parser() -> argparse.ArgumentParser:
             type=_identifier,
             metavar="ID",
             help="reuse an ID to retry a request without running it twice",
+        )
+        relation = leaf.add_mutually_exclusive_group()
+        relation.add_argument(
+            "--after",
+            dest="after_goal_id",
+            type=_identifier,
+            metavar="GOAL_ID",
+            help="queue this goal to start once GOAL_ID succeeds",
+        )
+        relation.add_argument(
+            "--replace",
+            dest="replace_goal_id",
+            type=_identifier,
+            metavar="GOAL_ID",
+            help="replace queued GOAL_ID or smoothly supersede active GOAL_ID mid-motion",
         )
 
     leaf = command(goal, "submit", goal_submit, "Submit a goal from a JSON file: an action, or a full request.")

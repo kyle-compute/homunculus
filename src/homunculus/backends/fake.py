@@ -39,18 +39,19 @@ from ..models import (
 )
 from ..profiles import (
     ActivityStatus,
+    JointPathJudge,
+    JointReference,
     PostureJudge,
-    TrajectoryJudge,
     VelocityJudge,
     WidthJudge,
-    sample_trajectory,
 )
-from ..runtime import Backend, BackendFacts, Clock, Feedback, GoalCommand, ResourceSpec, SystemClock
+from ..runtime import Backend, BackendFacts, Clock, Feedback, GoalCommand, ResourceSpec, StartupError, SystemClock
+from ..smooth import JointSmoothLimits
 
 NOTICE = "Fake robot: deterministic kinematics with no physics and no robot. Results are protocol evidence only."
 PERIOD_S = 0.02
 ZERO_VELOCITY = {"forward_m_s": 0.0, "left_m_s": 0.0, "yaw_rate_rad_s": 0.0}
-_Judge = TrajectoryJudge | WidthJudge | PostureJudge | VelocityJudge
+_Judge = JointPathJudge | WidthJudge | PostureJudge | VelocityJudge
 
 
 @dataclass
@@ -77,6 +78,7 @@ class _Group:
     settle_time_s: float
     still_for: float = 0.0
     motion: _Motion | None = None
+    reference: JointReference | None = None
     sample: Sample | None = None
 
 
@@ -156,6 +158,7 @@ def _g1() -> _Robot:
                 assistance="none: joints move to the named posture at a fixed speed",
                 stop_deadline_wall_s=0.5,
                 limits=hand,
+                replaceable=True,
             ),
         ],
         groups=[
@@ -243,6 +246,7 @@ def _arm() -> _Robot:
                 assistance="none: joints replay the validated trajectory",
                 stop_deadline_wall_s=0.5,
                 limits=arm,
+                replaceable=True,
             ),
             ProfileBinding(
                 profile="gripper.width/1",
@@ -254,6 +258,7 @@ def _arm() -> _Robot:
                 assistance="none: the jaw moves at a fixed speed",
                 stop_deadline_wall_s=0.5,
                 limits=gripper,
+                replaceable=True,
             ),
         ],
         groups=[
@@ -267,19 +272,23 @@ def _arm() -> _Robot:
 ROBOTS = {"g1": _g1, "arm": _arm}
 
 
-def robots() -> dict[str, Backend]:
+def robots(smooth: bool | str = False) -> dict[str, Backend]:
     """The robots `--backend fake` serves."""
+    if isinstance(smooth, str) and smooth.strip().lower() not in ("true", "1", "yes", "false", "0", "no"):
+        raise StartupError(f"backend option smooth={smooth!r} must be 'true' or 'false'")
+    enable_smooth = smooth if isinstance(smooth, bool) else smooth.strip().lower() in ("true", "1", "yes")
     clock = SystemClock()
-    return {"fake-g1": FakeBackend("g1", clock), "fake-arm": FakeBackend("arm", clock)}
+    return {"fake-g1": FakeBackend("g1", clock), "fake-arm": FakeBackend("arm", clock, smooth=enable_smooth)}
 
 
 class FakeBackend(Backend):
     reports_goal_samples = True
 
-    def __init__(self, robot: str, clock: Clock):
+    def __init__(self, robot: str, clock: Clock, *, smooth: bool = False):
         if robot not in ROBOTS:
             raise ValueError(f"unknown fake robot {robot!r}; choose from {sorted(ROBOTS)}")
         self._name = robot
+        self._smooth = smooth
         self._clock = clock
         self._last = clock.now()
         # A world lives in this process and names its clock's epoch, so the name must not repeat after a restart.
@@ -291,6 +300,31 @@ class FakeBackend(Backend):
 
     def _load(self) -> None:
         self._robot = ROBOTS[self._name]()
+        if self._smooth and self._name == "arm":
+            arm = self._robot.bindings[0].limits
+            self._robot.bindings.append(
+                ProfileBinding(
+                    profile="joints.smooth/1",
+                    target="arm",
+                    role="arm",
+                    resources=["arm"],
+                    modes=["goal"],
+                    controller="fake_arm_position",
+                    assistance="none: joints replay the solved C2 quintic path",
+                    stop_deadline_wall_s=0.5,
+                    replaceable=True,
+                    limits=JointSmoothLimits(
+                        profile="joints.smooth/1",
+                        joints=arm.joints,
+                        max_duration_s=arm.max_duration_s,
+                        start_position_tolerance=arm.start_position_tolerance,
+                        path_tolerance=arm.path_tolerance,
+                        goal_tolerance=arm.goal_tolerance,
+                        settle_velocity=arm.settle_velocity,
+                        settle_time_s=arm.settle_time_s,
+                    ),
+                )
+            )
         self._groups = {group.spec.id: group for group in self._robot.groups}
         self._time = 0.0
 
@@ -352,6 +386,7 @@ class FakeBackend(Backend):
 
     def _halt(self, group: _Group) -> None:
         group.motion = None
+        group.reference = None
         group.velocities = dict.fromkeys(group.velocities, 0.0)
         if group.spec.joints:
             group.hold = dict(group.positions)
@@ -389,6 +424,7 @@ class FakeBackend(Backend):
                     group.velocities = dict.fromkeys(group.velocities, 0.0)
                 elif status.phase == "done":
                     group.motion = None
+                    group.reference = None
                     group.hold.update(_reached(motion.judge))
                 feedback.activities[motion.activity_id] = status
 
@@ -412,13 +448,15 @@ class FakeBackend(Backend):
             feedback.samples[rid] = group.sample.model_copy(update={"valid": False}) if lost else group.sample
             feedback.stopped[rid] = not lost and group.motion is None and group.still_for >= group.settle_time_s
             feedback.holding[rid] = dict(group.hold)
+            if group.reference is not None:
+                feedback.references[rid] = group.reference
         return feedback
 
     def _judge(self, group: _Group, motion: _Motion, dt: float) -> ActivityStatus:
         """Hand the profile's judge what this group measures now."""
         judge = motion.judge
-        if isinstance(judge, TrajectoryJudge):
-            joints = judge.action.joints
+        if isinstance(judge, JointPathJudge):
+            joints = judge.joints
             positions, velocities = [group.positions[n] for n in joints], [group.velocities[n] for n in joints]
             return judge.update(self._time - motion.started, positions, velocities, dt)
         if isinstance(judge, WidthJudge):
@@ -434,8 +472,8 @@ def _pose(group: _Group) -> tuple[float, float, float]:
 
 def _reached(judge: _Judge) -> dict[str, float]:
     """What a group holds after its goal is met: the goal's own end point. A base holds zero velocity."""
-    if isinstance(judge, TrajectoryJudge):
-        return dict(zip(judge.action.joints, judge.action.points[-1].positions, strict=True))
+    if isinstance(judge, JointPathJudge):
+        return judge.end_positions()
     if isinstance(judge, WidthJudge):
         return {"jaw": judge.action.width_m}
     if isinstance(judge, PostureJudge):
@@ -445,12 +483,20 @@ def _reached(judge: _Judge) -> dict[str, float]:
 
 def _move(group: _Group, judge: _Judge, elapsed: float, dt: float, blocked: bool) -> None:
     """The fake's controllers: joints follow their command exactly, unless blocked. Nothing is simulated."""
-    if isinstance(judge, TrajectoryJudge):
-        reference, rates = sample_trajectory(judge.action.points, elapsed)
-        for name, position, rate in zip(judge.action.joints, reference, rates, strict=True):
+    if isinstance(judge, JointPathJudge):
+        prev_v = group.reference.velocities if group.reference is not None else dict.fromkeys(group.positions, 0.0)
+        reference, rates = judge.reference(elapsed)
+        ref_positions = dict(group.positions)
+        ref_velocities = dict.fromkeys(group.positions, 0.0)
+        ref_accelerations = dict.fromkeys(group.positions, 0.0)
+        for name, position, rate in zip(judge.joints, reference, rates, strict=True):
+            ref_positions[name] = position
+            ref_velocities[name] = rate
+            ref_accelerations[name] = (rate - prev_v.get(name, 0.0)) / dt if dt > 0 else 0.0
             if not blocked:
                 group.positions[name] = position
             group.velocities[name] = 0.0 if blocked else rate
+        group.reference = JointReference(ref_positions, ref_velocities, ref_accelerations)
     elif isinstance(judge, VelocityJudge):  # a timed goal, or a stream's setpoint
         command, duration = judge.command, judge.duration_s
         timed = duration is not None

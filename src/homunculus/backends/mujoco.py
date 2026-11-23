@@ -74,7 +74,7 @@ from ..models import (
     SessionOpen,
     TrajectoryPoint,
 )
-from ..profiles import ActivityStatus, TrajectoryJudge, WidthJudge, sample_trajectory
+from ..profiles import ActivityStatus, JointPathJudge, JointReference, WidthJudge
 from ..runtime import (
     Backend,
     BackendFacts,
@@ -88,6 +88,7 @@ from ..runtime import (
     StartupError,
     SystemClock,
 )
+from ..smooth import JointSmoothLimits
 
 PERIOD_S = 0.01
 # Physics never runs more than this far behind the host clock; beyond it, time is dropped and counted as lag.
@@ -101,14 +102,17 @@ MENAGERIE_DOCUMENTS = ("README.md", "LICENSE", "CHANGELOG.md")
 OPTICAL = np.diag([1.0, -1.0, -1.0])
 
 
-def robots(rig: str = "panda", robot_id: str | None = None) -> dict[str, Backend]:
+def robots(rig: str = "panda", robot_id: str | None = None, smooth: bool | str = False) -> dict[str, Backend]:
     """The robot `--backend mujoco` serves.
 
     Options: `rig`, the name of a rig that ships with homunculus or the path of a rig folder (default: the Panda
-    at a table); `robot_id` (default: the rig folder's name).
+    at a table); `robot_id` (default: the rig folder's name); `smooth` ('true' to also bind joints.smooth/1).
     """
+    if isinstance(smooth, str) and smooth.strip().lower() not in ("true", "1", "yes", "false", "0", "no"):
+        raise StartupError(f"backend option smooth={smooth!r} must be 'true' or 'false'")
+    enable_smooth = smooth if isinstance(smooth, bool) else smooth.strip().lower() in ("true", "1", "yes")
     folder = rigs.find(rig)
-    return {robot_id or folder.name: MujocoBackend(SystemClock(), folder)}
+    return {robot_id or folder.name: MujocoBackend(SystemClock(), folder, smooth=enable_smooth)}
 
 
 def _compile(folder: Path, rig: rigs.Rig) -> tuple[mujoco.MjModel, dict[str, str]]:
@@ -177,7 +181,7 @@ class _Motion:
     activity_id: str
     started: float
     columns: list[int]  # which of the group's joints the action commands
-    judge: TrajectoryJudge | WidthJudge  # holds the goal's action and limits
+    judge: JointPathJudge | WidthJudge  # holds the goal's action and limits
 
 
 @dataclass
@@ -195,6 +199,8 @@ class _Group:
     still_speed: float
     settle_time_s: float
     reference: np.ndarray  # the position each joint is asked to hold or follow
+    reference_velocity: np.ndarray  # velocity feedforward of the reference
+    reference_acceleration: np.ndarray  # finite-difference acceleration of the reference
     motion: _Motion | None = None
     still_for: float = 0.0
 
@@ -202,8 +208,9 @@ class _Group:
 class MujocoBackend(Backend):
     reports_goal_samples = True
 
-    def __init__(self, clock: Clock, folder: Path):
+    def __init__(self, clock: Clock, folder: Path, *, smooth: bool = False):
         """`folder` is a rig: rig.toml and the model it names."""
+        self._smooth = smooth
         rig = rigs.load(folder)
         arm, gripper, cameras = rig.arm, rig.gripper, rig.cameras
         self._model, revisions = _compile(folder, rig)
@@ -344,6 +351,8 @@ class MujocoBackend(Backend):
             still_speed=still_speed,
             settle_time_s=settle_time_s,
             reference=np.zeros(len(joints)),
+            reference_velocity=np.zeros(len(joints)),
+            reference_acceleration=np.zeros(len(joints)),
         )
 
     def _reset(self) -> None:
@@ -351,6 +360,8 @@ class MujocoBackend(Backend):
         mujoco.mj_forward(self._model, self._data)
         for group in self._groups.values():
             group.reference = self._data.qpos[group.qpos].copy()
+            group.reference_velocity.fill(0.0)
+            group.reference_acceleration.fill(0.0)
             group.motion, group.still_for = None, 0.0
         self._behind = self._lag = 0.0
 
@@ -372,8 +383,36 @@ class MujocoBackend(Backend):
                 ),
                 stop_deadline_wall_s=1.0,
                 limits=self._arm_limits,
+                replaceable=True,
             )
         ]
+        if self._smooth:
+            bindings.append(
+                ProfileBinding(
+                    profile="joints.smooth/1",
+                    target="arm",
+                    role="arm",
+                    resources=["arm"],
+                    modes=["goal"],
+                    controller="mujoco_arm_position",
+                    assistance=(
+                        "auto-timed C2 quintic joint position control with velocity feedforward through force-limited "
+                        "actuators; no gravity compensation, no collision avoidance"
+                    ),
+                    stop_deadline_wall_s=1.0,
+                    limits=JointSmoothLimits(
+                        profile="joints.smooth/1",
+                        joints=self._arm_limits.joints,
+                        max_duration_s=self._arm_limits.max_duration_s,
+                        start_position_tolerance=self._arm_limits.start_position_tolerance,
+                        path_tolerance=self._arm_limits.path_tolerance,
+                        goal_tolerance=self._arm_limits.goal_tolerance,
+                        settle_velocity=self._arm_limits.settle_velocity,
+                        settle_time_s=self._arm_limits.settle_time_s,
+                    ),
+                    replaceable=True,
+                )
+            )
         if self._gripper_limits is not None:
             bindings.append(
                 ProfileBinding(
@@ -386,6 +425,7 @@ class MujocoBackend(Backend):
                     assistance="the fingers are driven together toward the requested gap at a fixed speed",
                     stop_deadline_wall_s=1.0,
                     limits=self._gripper_limits,
+                    replaceable=True,
                 )
             )
         return BackendFacts(
@@ -446,9 +486,8 @@ class MujocoBackend(Backend):
 
     def apply(self, activity_id: str, contract: GoalCommand) -> None:
         group = self._groups[contract.resources[0]]
-        action = contract.action
-        if isinstance(action, JointTrajectoryGoal):
-            columns = [group.spec.joints.index(name) for name in action.joints]
+        if isinstance(contract.judge, JointPathJudge):
+            columns = [group.spec.joints.index(name) for name in contract.judge.joints]
         else:
             columns = list(range(len(group.spec.joints)))
         group.motion = _Motion(activity_id, self._data.time, columns, contract.judge)
@@ -461,6 +500,8 @@ class MujocoBackend(Backend):
         """The fallback: drop the motion and hold where the joints are measured to be."""
         group.motion = None
         group.reference = self._data.qpos[group.qpos].copy()
+        group.reference_velocity.fill(0.0)
+        group.reference_acceleration.fill(0.0)
         group.still_for = 0.0  # standstill has to be measured again after the command
 
     def manage(self, operation: str, parameters: dict[str, Any]) -> dict[str, Any]:
@@ -573,23 +614,31 @@ class MujocoBackend(Backend):
                 feedback.activities[group.motion.activity_id] = status
                 if status.phase == "done":
                     group.motion = None  # the reference it reached stays in place as the hold
+                    group.reference_velocity.fill(0.0)
+                    group.reference_acceleration.fill(0.0)
             feedback.stopped[rid] = group.motion is None and group.still_for >= group.settle_time_s
             feedback.holding[rid] = dict(zip(names, group.reference.tolist(), strict=True))
+            feedback.references[rid] = JointReference(
+                positions=dict(zip(names, group.reference.tolist(), strict=True)),
+                velocities=dict(zip(names, group.reference_velocity.tolist(), strict=True)),
+                accelerations=dict(zip(names, group.reference_acceleration.tolist(), strict=True)),
+            )
         return feedback
 
     def _control(self, group: _Group, step: float) -> None:
         """One physics step of one group: update the reference, command the actuators, judge the motion."""
         data = self._data
         positions, velocities = data.qpos[group.qpos], data.qvel[group.dof]
+        previous_velocity = group.reference_velocity.copy()
         rates = np.zeros(len(group.reference))
         motion = group.motion
         status = motion.judge.status if motion is not None else None
         if motion is not None and (status is None or status.phase in ("executing", "finishing")):
             judge = motion.judge
-            if isinstance(judge, TrajectoryJudge):
-                # joints.trajectory/1: follow the validated path.
+            if isinstance(judge, JointPathJudge):
+                # joints.trajectory/1, joints.smooth/1, or any registered JointPathJudge: follow its reference.
                 elapsed = data.time - motion.started
-                reference, wanted = sample_trajectory(judge.action.points, elapsed)
+                reference, wanted = judge.reference(elapsed)
                 columns = motion.columns
                 group.reference[columns] = reference
                 status = judge.update(elapsed, positions[columns].tolist(), velocities[columns].tolist(), step)
@@ -602,6 +651,8 @@ class MujocoBackend(Backend):
                 reach = judge.limits.speed_m_s / fingers * step
                 group.reference += np.clip(share - group.reference, -reach, reach)
                 judge.update(float(positions.sum()), step)
+        group.reference_velocity = rates
+        group.reference_acceleration = (rates - previous_velocity) / step if step > 0 else np.zeros_like(rates)
         # Each actuator's force is gain*ctrl + bias0 + bias1*length + bias2*velocity. This ctrl turns it into a
         # spring and damper on the error from the reference length and velocity, so the damping acts on the
         # velocity error instead of on the motion itself.
