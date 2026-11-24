@@ -211,16 +211,19 @@ error: fake-g1 does not offer joints.trajectory/1 as a goal; it offers: base.pla
 | `homunculus observe [--camera NAME] [--save DIR]` | Read measurements; with `--camera`, save the robot's camera images and print their paths |
 | `homunculus video CAMERA` | Print a link that plays a camera live in a browser, the robot's or a spectator's |
 | `homunculus session open / renew / close` | Take, extend or release control |
-| `homunculus goal joints / gripper / hand / base` | Request one finite movement |
+| `homunculus goal joints / gripper / hand / pose / base` | Request one finite movement |
 | `homunculus goal submit --file move.json` | Request any movement written as JSON |
 | `homunculus goal inspect / cancel` | Follow or stop the last goal |
 | `homunculus stream open / update / inspect / close` | Continuous velocity targets that expire unless renewed |
 | `homunculus stop [--operator]` | Stop everything and wait until standstill is measured |
 | `homunculus manage recover / world.reset` | Operator operations the robot advertises |
+| `homunculus operation inspect` | Follow a stop or an operator operation |
 | `homunculus events [--follow]` | Numbered runtime events |
 
 Every command has `--help`. Useful flags on goals: `--wait`, `--dry-run` (check without
-moving), `--request-id ID` (a retry never runs twice), `--max-execution S`.
+moving), `--request-id ID` (a retry never runs twice), `--max-execution S`, `--after GOAL_ID` (start
+once that goal succeeds), `--replace GOAL_ID` (take the place of a queued goal, or of a moving one where
+the profile is `replaceable` in `homunculus --json describe`; nothing on the `task` backend is).
 
 ## Output and exit codes
 
@@ -268,11 +271,22 @@ refused with `session_conflict`. Leave it out to work in the CLI's session.
 - The MuJoCo backend does not compensate gravity, needs a keyframe named `home`, and refuses a
   camera set by sensor size. For those reasons 11 of Menagerie's 28 arms do not pass
   `homunculus install` as they are.
-- Implemented profiles: `joints.trajectory/1`, `gripper.width/1`, `hand.posture/1`,
-  `base.planar_velocity/1`. Tool-pose movement and contact-based gripper completion are refused
-  as unsupported.
-- The `task` backend is tested only with `g1-dining-salt-mill`. It walks and grips but has no
-  arm control, so it cannot solve that task.
+- Implemented profiles: `joints.trajectory/1`, `joints.smooth/1`, `gripper.width/1`,
+  `gripper.grasp/1`, `hand.posture/1`, `tool.pose.linear/1`, `base.planar_velocity/1`. No backend
+  offers all of them; `homunculus describe` lists a robot's own.
+  - `tool.pose.linear/1` (`goal pose`) and `gripper.grasp/1` are offered by the `task` backend only.
+    `gripper.grasp/1` has no command of its own: submit it with `goal submit --file`.
+  - `joints.smooth/1` is offered by `fake:arm` and the `mujoco` backend, with `--backend-arg
+    smooth=true`. It also goes through `goal submit --file`.
+  - `gripper.width/1` completes on the measured width only. Completion on contact is refused.
+- The `task` backend walks, moves either hand or both together to a pose, grips with the left jaws
+  and sets the right hand's posture. It has no joint control and no streams. There is no obstacle
+  planning, no way to command a force, and a base goal cannot reliably move a few centimetres.
+- The `task` backend was run on five G1 tasks. Driving only this command line, a scripted solution
+  earned reward 1 from the task's own verifier on three (`g1-dining-salt-mill`, `dining-loaded-tray`,
+  `dining-loaded-tray-allfixes`; not on every run of the tray tasks) and has not solved
+  `storage-supporting-box` or `office-paper-injection`. Those runs predate merging `--after`,
+  `--replace` and `joints.smooth/1` with the task backend's current code, and have not been repeated since.
 
 ## Documentation
 
@@ -305,6 +319,7 @@ uv run ruff check && uv run ruff format --check
 Code is in `src/homunculus/`: `cli.py` (commands and output), `client.py` (HTTP client and
 saved targets), `server.py` (HTTP service and backend loading), `runtime.py` (sessions, goals,
 streams, stops, and the `Backend` base class), `profiles.py` (what each motion profile means,
-and the judges that decide success), `models.py` (shared types), `backends/`, and `rigs/` (the
-rigs that ship, and the reader of `rig.toml`). The MuJoCo tests download three robots from
+and the judges that decide success), `grasp.py` and `smooth.py` (the two profiles defined outside
+it), `models.py` (shared types), `backends/`, and `rigs/` (the rigs that ship, and the reader of
+`rig.toml`). The MuJoCo tests download three robots from
 Menagerie, 9.3 MB, the first time they run.

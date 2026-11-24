@@ -4,6 +4,7 @@ How each part of `homunculus` behaves, in more detail than the [README](../READM
 
 - [Targets](#targets)
 - [A finite movement](#a-finite-movement)
+- [Queueing and replacing goals](#queueing-and-replacing-goals)
 - [A continuous target](#a-continuous-target)
 - [Two robots, one client](#two-robots-one-client)
 - [Stopping, recovery, reset](#stopping-recovery-reset)
@@ -79,6 +80,56 @@ usage: homunculus goal cancel [-h] [-t TARGET] [--json] [--no-wait] [--timeout S
                          [GOAL_ID]
 homunculus goal cancel: error: argument GOAL_ID: it is empty; if a shell variable should hold it, that variable is not set
 ```
+
+## Queueing and replacing goals
+
+A goal on a resource that is already moving is refused with `resource_busy`,
+unless it says how it relates to the goal in the way. A goal takes at most one
+of two flags (`after_goal_id` and `replace_goal_id` in a request file):
+
+```sh
+homunculus goal joints joint4=-2.2 --duration 2                    # prints its goal ID
+homunculus goal joints joint4=-1.8 --duration 1 --after GOAL_ID    # starts once that goal succeeds
+homunculus goal joints joint4=-1.2 --duration 1 --replace GOAL_ID  # takes that goal's place
+```
+
+`--after` queues a goal, on the same resource or another. When the goal before
+it ends any other way (it fails, or is cancelled or replaced), the queued goal
+is cancelled with `predecessor_failed`, nothing of it having moved, and so is
+whatever is queued behind it. Conditions are checked when the goal is queued,
+against what the goals before it are expected to leave, and again against
+measurements when it starts. Its execution deadline starts with its turn, but
+its wall deadline runs from when it was accepted, time in the queue included:
+allow for the goals ahead with `--max-wall`, or it fails with
+`precondition_changed` before it starts. At most 8 goals wait at once on one
+robot.
+
+`--replace` takes the place of a goal that is queued or moving. The replaced
+goal ends `cancelled (superseded)`, and goals queued behind it are cancelled.
+Replacing a queued goal works on every robot. Replacing one that moves needs
+the same resources and a profile the robot lists as `replaceable` in
+`homunculus --json describe`; any other is refused with `unsupported_mode`. On
+the fake robots those are the arm, the gripper and the hand; on `mujoco`, the
+arm and the gripper; on `task`, none. A moving arm goes on from its
+controller's current reference without stopping, and a joint that still moves
+must be among those the new goal commands. A goal that has already ended
+cannot be replaced (`start_condition_failed`). `homunculus stop` cancels queued
+goals too.
+
+`joints.smooth/1` suits replacement: it is given positions and no duration, and
+takes the shortest smooth path within the joints' position, velocity and
+acceleration limits, from rest or from a goal it replaces. `fake:arm` and
+`mujoco` offer it when started with `--backend-arg smooth=true`. It has no
+command of its own:
+
+```sh
+homunculus goal submit --file - --replace GOAL_ID --wait <<'JSON'
+{"profile": "joints.smooth/1", "target": "arm", "positions": {"joint4": -1.5}}
+JSON
+```
+
+`speed_scale` (above 0, at most 1) slows it, and `min_duration_s` makes it take
+at least that long.
 
 ## A continuous target
 
@@ -555,8 +606,10 @@ error after the video has begun ends the video, and the service log says why.
 
 ## A downloaded benchmark task
 
-The `task` backend connects one existing task (tested with
-`g1-dining-salt-mill`) without copying or changing it. It starts the task's own
+The `task` backend connects one existing task (run with
+`g1-dining-salt-mill`, `dining-loaded-tray`, `dining-loaded-tray-allfixes`,
+`storage-supporting-box` and `office-paper-injection`) without copying or
+changing it. It starts the task's own
 simulator entry point with an interpreter you provide, drives it through the
 task's own HTTP controls, and leaves the recorded episode where the task's own
 verifier can grade it. The task and its assets stay where they are.
@@ -611,6 +664,19 @@ homunculus serve --backend task --backend-arg url=http://127.0.0.1:8080 \
 That simulator records the episode in its own state directory, where the
 task's `collect` and verifier find it as usual.
 
+Two options fit the adapter to a task, with either way of starting it:
+
+- `--backend-arg hands_follow_base=true`: a base goal also sends both hand
+  targets with every step, moved and turned with the measured base, for walking
+  with something in both hands. The goal then takes the base and both arms, and
+  ends once the arms are at rest too. If it fails or is stopped, the arms keep
+  their carried targets instead of holding where they are measured. Default
+  `false`.
+- `--backend-arg arm_still_m=M`: how far a hand's tool site may move in one
+  0.05 s step while its arm counts as at rest, in metres (default 0.0005, below
+  0.05). Arms that tremble under a load need more, or no stop of a loaded arm is
+  ever confirmed. `dining-loaded-tray` uses 0.006.
+
 What the adapter maps, and what it does not:
 
 - `base.planar_velocity/1` as a timed goal, executed as the task's `step`
@@ -627,6 +693,13 @@ What the adapter maps, and what it does not:
   The task is then stepped at rest until the measured gap has stayed within
   3 mm of the request for 0.2 s and the jaws are still, for at most 4 s; a gap
   that does not get there fails with `width_not_reached`.
+- `gripper.grasp/1` on the left parallel gripper: one `grip` to closed, judged on
+  the gap the jaws stop at. It succeeds if that gap is wider than `min_width_m`
+  and no wider than `max_width_m` (left out: 0.01 m and 0.10 m), and fails with
+  `nothing_grasped` or `unexpected_width` otherwise. The jaws keep squeezing
+  until another gripper goal. It has no command of its own: use
+  `homunculus goal submit --file` with
+  `{"profile": "gripper.grasp/1", "target": "left_gripper"}`.
 - `tool.pose.linear/1` on `left_hand` and `right_hand` (the task's `left_tool`
   and `right_tool` sites), executed as the task's `step` actions with a hand
   target moving every 0.1 s along a straight segment and a shortest-path turn,
@@ -636,13 +709,19 @@ What the adapter maps, and what it does not:
   pose for 0.2 s within 3 s (`goal_not_reached` otherwise). A goal may loosen
   those to 5 cm and 0.3 rad, for example while carrying something. Positions
   are bounded as the task bounds hand targets: z from 0.55 to 1.35 m. The
-  hand target stays fixed in the world while the base walks.
+  hand target stays fixed in the world while the base walks, unless
+  `hands_follow_base` is set.
   On Modal, 46 of 48 free-space goals (each hand; 10 cm moves and 0.5 rad
   turns at 0.04 to 0.2 m/s) succeeded with at most 2.1 cm off the segment and
   8.6 mm and 0.026 rad from the pose; the two failures stopped 2 to 3 cm short
   with the right hand low beside the body.
+- `tool.pose.linear/1` on `both_hands`, for an object held in both: the left tool
+  site is commanded and judged as above, and each step carries the right hand
+  target rigidly with it. The goal also fails (`path_tolerance_violated`) if the
+  right hand is measured more than 5 cm from where it is carried.
 - `hand.posture/1` on the right hand's articulated fingers, with the postures
-  `open` (the task's finger targets at opening 1) and `closed` (the angles an
+  `open` (the task's finger targets at opening 1), `open_50`, `open_40` and
+  `open_30` (partly open), and `closed` (the angles an
   empty hand reaches at opening 0, where its fingers stop on each other about
   0.27 rad short of the task's targets), executed as the task's `grip`. Fingers closed on an object stop short of
   `closed`, so that goal fails with `posture_not_reached` and the contact
@@ -655,8 +734,8 @@ What the adapter maps, and what it does not:
   they offer no live video.
 - Not mapped: the task's planned `reach`, `move_hand` (a pose goal does the
   same motion through `step`, and is measured on the way), `walk_to`, and
-  `wait`. Goals run one at a time, although the task could move several parts
-  in one step.
+  `wait`. No profile commands joints or a force. Goals run one at a time,
+  although the task could move several parts in one step.
 
 The task's world is stepped: physics advances only while a goal runs, so there
 is no stream profile, and each goal spends several of the task's 6,000 control
@@ -712,6 +791,10 @@ Rules a backend keeps:
   connection. The service calls it when it ends, however it ends, a start that
   failed included. A backend is a context manager, so code of your own builds
   one in a `with`.
+- A binding that can be replaced while it moves says `replaceable=True`. Its
+  `apply()` may then be called while its previous goal still runs, with no
+  `stop()` between. A joint controller also reports its current reference in
+  `Feedback.references`, so the next motion goes on from there.
 - `describe()` says what moves the robot, in its `BackendInfo`: `physics` is
   `none` (a fake that sets its joints as commanded), `simulated`, or `real`.
   `homunculus describe` shows it after the robot's name, as in
@@ -744,8 +827,9 @@ names the profile (for example `gripper.grasp/1`) and holds:
   `profiles.Reading` carries the resource's sample values and the time since
   activation.
 - Optionally `activate`, to bind a request to the measured start (as a
-  trajectory does), and `duration_s`, if a request states how long its
-  motion takes.
+  trajectory does), `duration_s`, if a request states how long its
+  motion takes, and `expected_end`, the sample values its success is expected
+  to leave, so that a goal queued behind it can be checked early.
 
 Register it before the service starts, for example in the module that defines
 your backend; a backend that binds a profile no one registered does not start.
@@ -878,9 +962,11 @@ stopped while it was starting.
 - Saved camera images are never removed from `$HOMUNCULUS_HOME/images`.
 - Stream updates are separate HTTP requests; a persistent update channel
   is reported as unavailable. No MCP adapter yet.
-- Profiles implemented: `joints.trajectory/1`, `gripper.width/1`,
-  `hand.posture/1`, `base.planar_velocity/1`. Tool-pose and contact-qualified
-  gripper completion are not, and are rejected as unsupported.
+- Profiles implemented: `joints.trajectory/1`, `joints.smooth/1`,
+  `gripper.width/1`, `gripper.grasp/1`, `hand.posture/1`, `tool.pose.linear/1`,
+  `base.planar_velocity/1`. Only the `task` backend offers `tool.pose.linear/1`
+  and `gripper.grasp/1`. `gripper.width/1` completing on contact
+  (`contact_detected`) is not implemented, and is rejected as unsupported.
 - The task adapter's tracking tolerance was qualified on recorded walks of one
   task. It catches a base that stops against an obstacle; a slow sideways push
   (under about 0.1 m/s) that slides along the obstacle can still pass.
